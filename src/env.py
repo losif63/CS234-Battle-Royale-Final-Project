@@ -85,6 +85,12 @@ class GameEnv:
         # TODO: Check collisions and alter reward
         reward = cfg.REWARD_PER_STEP
         collision = False
+        for arrow in self.arrows:
+            if distance(self.agent.get_position(), arrow.get_position()) < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
+                collision = True
+                reward = cfg.REWARD_COLLISION
+                self.done = True
+                break
 
         
         # TODO: Alter reward based on other policy (like nearness to arrow)
@@ -98,7 +104,7 @@ class GameEnv:
             "collision": collision
         }
         
-        return ({"observation": obs, "info": info}, reward, self.done, info)
+        return (obs, reward, self.done, info)
 
     # Get observations -> That is, info about all arrows within agent's vision range 
     def get_obs(self) -> Dict:

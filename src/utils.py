@@ -46,3 +46,9 @@ def spawn_arrow(
     gain = speed / v_norm
     
     return (x, y, vx * gain, vy * gain)
+
+def detect_object_collision(
+    p1, r1, p2, r2,
+) -> bool:
+    dist = distance(p1, p2)
+    return dist < (r1 + r2)

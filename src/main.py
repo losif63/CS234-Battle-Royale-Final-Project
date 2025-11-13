@@ -1,7 +1,7 @@
 # Author: Jaduk Suh
 # Created: November 13th
 import pygame
-
+from argparse import ArgumentParser
 from env import GameEnv
 
 
@@ -61,19 +61,25 @@ def main():
         
         # Print score periodically
         if info.get("time_alive", 0) % 60 == 0 and info.get("time_alive", 0) > 0:
-            print(f"Time alive: {info['time_alive']}, Arrows: {info.get('num_arrows', 0)}")
+            print(f"Time alive: {info['time_alive'] // 60} seconds, Arrows in environment: {info.get('num_arrows', 0)}")
         
         # Check if done (collision)
         if done:
             print(f"Game Over! Final time alive: {info.get('time_alive', 0)}")
-            # Wait a moment then reset
             pygame.time.wait(2000)
-            env.reset()
-            print("Resetting...")
+            
+            # Uncomment below code to Restart after game over
+            # env.reset()
+            # print("Resetting...")
+            
+            # Terminate
+            running = False
+            break
     
     env.close()
 
 
 if __name__ == "__main__":
+    parser = ArgumentParser()
     main()
 

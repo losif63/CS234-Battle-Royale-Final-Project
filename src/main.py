@@ -2,7 +2,7 @@
 # Created: November 13th
 import pygame
 from argparse import ArgumentParser
-from env import GameEnv
+from src.env import GameEnv
 
 
 def main():

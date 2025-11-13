@@ -1,11 +1,11 @@
 # Author: Jaduk Suh
 # Created: November 13th
-import config as cfg
+import src.config as cfg
 import pygame
-from objects import Agent, Arrow
+from src.objects import Agent, Arrow
 from typing import List, Optional, Dict, Tuple
 import random
-from utils import distance, spawn_arrow
+from src.utils import distance, spawn_arrow
 import math
 
 

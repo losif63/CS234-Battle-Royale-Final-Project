@@ -68,6 +68,8 @@ class GameEnv:
                 cfg.ARENA_HEIGHT,
                 cfg.ARROW_SPEED_MIN,
                 cfg.ARROW_SPEED_MAX,
+                self.agent.x,
+                self.agent.y
             )
             self.arrows.append(Arrow(x, y, vx, vy, cfg.ARROW_RADIUS)
 )

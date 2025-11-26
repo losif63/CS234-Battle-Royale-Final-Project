@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Tuple
 import random
 from src.utils import distance, spawn_arrow
 import math
+import torch
 
 
 class GameEnv:
@@ -62,7 +63,7 @@ class GameEnv:
         self.agent.move(dx, dy, cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
         
         # TODO: Spawn new arrows
-        if random.random() < cfg.ARROW_SPAWN_RATE:
+        if random.random() < cfg.ARROW_SPAWN_RATE and len(self.arrows) < cfg.ARROW_MAX_NUMBER:
             x, y, vx, vy = spawn_arrow(
                 cfg.ARENA_WIDTH,
                 cfg.ARENA_HEIGHT,
@@ -108,26 +109,33 @@ class GameEnv:
         
         return (obs, reward, self.done, info)
 
-    # Get observations -> That is, info about all arrows within agent's vision range 
+    # Get observations
+    # observation -> Pytorch vector
+    # Relative position & velocities of 20 closest arrows
     def get_obs(self) -> Dict:
+        obs = torch.zeros((82), dtype=torch.float32)
         agent_pos = self.agent.get_position()
-        visible_arrows = []
-        
+        agent_x, agent_y = agent_pos
+        obs[0] = agent_x
+        obs[1] = agent_y
+
+        visible_arrows = []        
         # Filter arrows by vision radius
         for arrow in self.arrows:
             dist = distance(agent_pos, arrow.get_position())
             if dist <= cfg.VISION_RADIUS:
-                visible_arrows.append((
-                    arrow.x,
-                    arrow.y,
-                    arrow.vx,
-                    arrow.vy
-                ))
-        
-        return {
-            "agent_pos": agent_pos,
-            "arrows": visible_arrows,
-        }
+                visible_arrows.append((dist, arrow))        
+        visible_arrows.sort()
+        for i in range(min(20, len(visible_arrows))):
+            dist, arrow = visible_arrows[i]
+            arrow_x, arrow_y = arrow.get_position()
+            arrow_vx, arrow_vy = arrow.get_velocity()
+            obs[4*i] = arrow_x - agent_x
+            obs[4*i+1] = arrow_y - agent_y
+            obs[4*i+2] = arrow_vx
+            obs[4*i+3] = arrow_vy
+
+        return obs
     
     def render(self, view: bool = True):
         if not view:

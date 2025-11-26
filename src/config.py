@@ -25,6 +25,7 @@ ARROW_SPAWN_RATE = 0.1  # Probability per step
 ARROW_SPEED_MIN = 2.0
 ARROW_SPEED_MAX = 8.0
 ARROW_RADIUS = 8.0
+ARROW_MAX_NUMBER = 50 # Keep 50 arrows at a time
 
 # Vision / Fog of War
 VISION_RADIUS = 150.0

@@ -62,7 +62,6 @@ class GameEnv:
         
         self.agent.move(dx, dy, cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
         
-        # TODO: Spawn new arrows
         if random.random() < cfg.ARROW_SPAWN_RATE and len(self.arrows) < cfg.ARROW_MAX_NUMBER:
             x, y, vx, vy = spawn_arrow(
                 cfg.ARENA_WIDTH,
@@ -85,18 +84,23 @@ class GameEnv:
             if not arrow.is_out_of_bounds(cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
         ]
         
-        # TODO: Check collisions and alter reward
         reward = cfg.REWARD_PER_STEP
         collision = False
+        min_distance = float("inf")
         for arrow in self.arrows:
-            if distance(self.agent.get_position(), arrow.get_position()) < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
+            dist = distance(self.agent.get_position(), arrow.get_position())
+            if dist < min_distance:
+                min_distance = dist
+            if dist < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
                 collision = True
                 reward = cfg.REWARD_COLLISION
                 self.done = True
                 break
 
         
-        # TODO: Alter reward based on other policy (like nearness to arrow)
+        # Alter reward based on other nearness to arrow
+        if min_distance < cfg.VISION_RADIUS:
+            reward -= cfg.REWARD_MIN_DIST_ALPHA * (1 / (min_distance) + 0.01)
         
         self.time_alive += 1
         
@@ -106,6 +110,7 @@ class GameEnv:
             "num_arrows": len(self.arrows),
             "collision": collision
         }
+        # print(reward, obs)
         
         return (obs, reward, self.done, info)
 
@@ -116,8 +121,8 @@ class GameEnv:
         obs = torch.zeros((82), dtype=torch.float32)
         agent_pos = self.agent.get_position()
         agent_x, agent_y = agent_pos
-        obs[0] = agent_x
-        obs[1] = agent_y
+        obs[0] = agent_x / cfg.ARENA_WIDTH
+        obs[1] = agent_y / cfg.ARENA_HEIGHT
 
         visible_arrows = []        
         # Filter arrows by vision radius
@@ -130,10 +135,10 @@ class GameEnv:
             dist, arrow = visible_arrows[i]
             arrow_x, arrow_y = arrow.get_position()
             arrow_vx, arrow_vy = arrow.get_velocity()
-            obs[4*i] = arrow_x - agent_x
-            obs[4*i+1] = arrow_y - agent_y
-            obs[4*i+2] = arrow_vx
-            obs[4*i+3] = arrow_vy
+            obs[4*i+2] = (arrow_x - agent_x) / cfg.VISION_RADIUS
+            obs[4*i+3] = (arrow_y - agent_y) / cfg.VISION_RADIUS
+            obs[4*i+4] = arrow_vx / cfg.ARROW_SPEED_MAX
+            obs[4*i+5] = arrow_vy / cfg.ARROW_SPEED_MAX
 
         return obs
     

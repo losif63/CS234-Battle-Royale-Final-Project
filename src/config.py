@@ -31,8 +31,8 @@ ARROW_MAX_NUMBER = 50 # Keep 50 arrows at a time
 VISION_RADIUS = 150.0
 
 # Reward
-REWARD_PER_STEP = 1.0
-REWARD_COLLISION = -100.0
-REWARD_MIN_DIST_SCALE = 0.0  # Optional: negative reward for proximity
+REWARD_PER_STEP = 0.1
+REWARD_COLLISION = -10.0
+REWARD_MIN_DIST_ALPHA = 2.5  # Optional: negative reward for proximity
 
 

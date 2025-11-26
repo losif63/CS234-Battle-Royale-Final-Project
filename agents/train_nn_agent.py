@@ -24,11 +24,11 @@ def main(args):
     env.reset()
 
     q_net = Q()
-    optimizer = torch.optim.Adam(q_net.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(q_net.parameters(), lr=5e-4, weight_decay=1e-5)
     gamma = 0.9
     epsilon = 1.0
     epsilon_min = 0.05
-    epsilon_decay = 0.995
+    epsilon_decay = 0.999
 
     num_episodes = 1000
     max_steps_per_episode = 3600
@@ -43,6 +43,7 @@ def main(args):
 
         obs = env.get_obs()
         while not done and step < max_steps_per_episode:
+            optimizer.zero_grad()
             # Select action with epsilon-greedy method
             action = select_action(q_net, obs, epsilon)
 
@@ -55,10 +56,9 @@ def main(args):
             if args.render:
                 env.render(view=True)
             
-
-            
             # TD Learning
             q_values = q_net(obs)
+            # print(q_values, obs)
             q_sa = q_values[action]
             
             with torch.no_grad():

@@ -8,6 +8,9 @@ from typing import Tuple
 def distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
     return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
+def manhattan_distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
+    return math.fabs(p1[0] - p2[0]) + math.fabs(p1[1] - p2[1])
+
 # Spawn arrow on edge of arena
 # TODO: Make arrow point toward agent with certain probability
 def spawn_arrow(

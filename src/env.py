@@ -5,7 +5,7 @@ import pygame
 from src.objects import Agent, Arrow
 from typing import List, Optional, Dict, Tuple
 import random
-from src.utils import distance, spawn_arrow
+from src.utils import distance, manhattan_distance, spawn_arrow
 import math
 import torch
 
@@ -86,21 +86,17 @@ class GameEnv:
         
         reward = cfg.REWARD_PER_STEP
         collision = False
-        min_distance = float("inf")
         for arrow in self.arrows:
             dist = distance(self.agent.get_position(), arrow.get_position())
-            if dist < min_distance:
-                min_distance = dist
+            man_dist = manhattan_distance(self.agent.get_position(), arrow.get_position())
+            if dist < cfg.VISION_RADIUS:
+                reward -= cfg.REWARD_MIN_DIST_ALPHA * (1 / man_dist)
+            
             if dist < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
                 collision = True
                 reward = cfg.REWARD_COLLISION
                 self.done = True
                 break
-
-        
-        # Alter reward based on other nearness to arrow
-        if min_distance < cfg.VISION_RADIUS:
-            reward -= cfg.REWARD_MIN_DIST_ALPHA * (1 / (min_distance) + 0.01)
         
         self.time_alive += 1
         

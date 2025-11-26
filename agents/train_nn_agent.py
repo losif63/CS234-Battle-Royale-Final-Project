@@ -9,12 +9,12 @@ import torch
 
 # Select action based on epsilon-greedy
 def select_action(q_net, obs, epsilon):
+    q_values = q_net(obs)
     if random.random() < epsilon:
-        return random.randint(0, 4)
+        return q_values, random.randint(0, 4)
     
     with torch.no_grad():
-        q_values = q_net(obs)
-        return torch.argmax(q_values).item()
+        return q_values, torch.argmax(q_values).item()
 
 def main(args):
     # Initialize pygame first
@@ -45,7 +45,7 @@ def main(args):
         while not done and step < max_steps_per_episode:
             optimizer.zero_grad()
             # Select action with epsilon-greedy method
-            action = select_action(q_net, obs, epsilon)
+            q_values, action = select_action(q_net, obs, epsilon)
 
             # Go one step
             next_obs, reward, done, info = env.step(action)
@@ -57,7 +57,6 @@ def main(args):
                 env.render(view=True)
             
             # TD Learning
-            q_values = q_net(obs)
             # print(q_values, obs)
             q_sa = q_values[action]
             
@@ -65,7 +64,7 @@ def main(args):
                 if done:
                     target = reward
                 else:
-                    target = reward + gamma * torch.max(q_net(next_obs)).item()
+                    target = reward + gamma * torch.max(q_net(next_obs))
             loss = (target - q_sa) ** 2
             loss.backward()
             optimizer.step()

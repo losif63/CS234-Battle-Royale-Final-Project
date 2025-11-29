@@ -105,14 +105,8 @@ class GameEnv:
         self.time_alive += 1
         
         obs = self.get_obs()
-        info = {
-            "time_alive": self.time_alive,
-            "num_arrows": len(self.arrows),
-            "collision": collision
-        }
-        # print(reward, obs)
         
-        return (obs, reward, self.done, info)
+        return (obs, reward, self.done)
 
     # Get observations
     # observation -> Pytorch vector

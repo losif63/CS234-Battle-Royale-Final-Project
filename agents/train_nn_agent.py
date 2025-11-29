@@ -6,6 +6,41 @@ from src.env import GameEnv
 import pygame
 import argparse
 import torch
+from collections import deque
+
+class ReplayBuffer():
+    def __init__(self):
+        self.obs = deque()
+        self.actions = deque()
+        self.rewards = deque()
+        self.next_obs = deque()
+        self.max_capacity = 5000
+        return
+
+    def __len__(self):
+        return len(self.obs)
+
+    def push(self, o, a, r, next_o):
+        if len(self.obs) >= self.max_capacity:
+            self.obs.popleft()
+            self.actions.popleft()
+            self.rewards.popleft()
+            self.next_obs.popleft()
+        
+        self.obs.append(o)
+        self.actions.append(a)
+        self.rewards.append(r)
+        self.next_obs.append(next_o)
+        return
+    
+    def sample(self, batch_size):
+        idxs = random.sample(range(len(self.obs)), batch_size)
+        obs_batch = torch.stack([self.obs[i] for i in idxs])
+        actions_batch = torch.tensor([self.actions[i] for i in idxs], dtype=torch.long)
+        rewards_batch = torch.tensor([self.rewards[i] for i in idxs], dtype=torch.float32)
+        next_obs_batch = torch.stack([self.next_obs[i] for i in idxs])
+        return obs_batch, actions_batch, rewards_batch, next_obs_batch
+        
 
 # Select action based on epsilon-greedy
 def select_action(q_net, obs, epsilon):
@@ -25,13 +60,17 @@ def main(args):
 
     q_net = Q()
     optimizer = torch.optim.Adam(q_net.parameters(), lr=5e-4, weight_decay=1e-5)
+    buffer = ReplayBuffer()
     gamma = 0.9
     epsilon = 1.0
     epsilon_min = 0.05
-    epsilon_decay = 0.999
+    epsilon_decay = 0.9993
 
-    num_episodes = 1000
+    num_episodes = 3000
     max_steps_per_episode = 3600
+
+    warmup_steps = 1000
+    batch_size = 16
     
     print(f"Q-Learning for {num_episodes} episodes...")
     
@@ -43,32 +82,50 @@ def main(args):
 
         obs = env.get_obs()
         while not done and step < max_steps_per_episode:
-            optimizer.zero_grad()
             # Select action with epsilon-greedy method
             q_values, action = select_action(q_net, obs, epsilon)
 
             # Go one step
-            next_obs, reward, done, info = env.step(action)
+            next_obs, reward, done = env.step(action)
             total_reward += reward
             step += 1
             
             # Render
             if args.render:
                 env.render(view=True)
-            
-            # TD Learning
-            # print(q_values, obs)
-            q_sa = q_values[action]
-            
-            with torch.no_grad():
-                if done:
-                    target = reward
-                else:
-                    target = reward + gamma * torch.max(q_net(next_obs))
-            loss = (target - q_sa) ** 2
-            loss.backward()
-            optimizer.step()
+
+            buffer.push(obs, action, reward, next_obs)
             obs = next_obs
+
+            if len(buffer) >= warmup_steps:
+                optimizer.zero_grad()
+
+                # TD Learning
+                # Experience Replay
+                obs_b, act_b, rew_b, next_obs_b = buffer.sample(batch_size)
+                q_values = q_net(obs_b)
+                q_sa = q_values.gather(1, act_b.unsqueeze(1)).squeeze(1)
+
+                 # Target: r + gamma * max_a' Q(s', a')
+                with torch.no_grad():
+                    q_next = q_net(next_obs_b)          # [B, num_actions]
+                    max_q_next = q_next.max(dim=1).values
+                    targets = rew_b + gamma * max_q_next
+                
+                loss = torch.mean((targets - q_sa) ** 2)
+                loss.backward()
+                optimizer.step()
+            
+            # q_sa = q_values[action]
+            # with torch.no_grad():
+            #     if done:
+            #         target = reward
+            #     else:
+            #         target = reward + gamma * torch.max(q_net(next_obs))
+            # loss = (target - q_sa) ** 2
+            # loss.backward()
+            # optimizer.step()
+            
 
         # Decay epsilon for epsilon-greedy
         epsilon = max(epsilon_min, epsilon * epsilon_decay)

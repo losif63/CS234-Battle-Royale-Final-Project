@@ -33,7 +33,7 @@ def main(args):
         action = select_action(q_net, obs)
 
         # Go one step
-        next_obs, reward, done, info = env.step(action)
+        next_obs, reward, done = env.step(action)
         total_reward += reward
         step += 1
         

@@ -40,6 +40,32 @@ class GameEnv:
         self.time_alive = 0
         self.done = False
 
+    def center_distance_penalty(self, agent_pos):
+        cx, cy = cfg.ARENA_WIDTH / 2, cfg.ARENA_HEIGHT / 2
+        ax, ay = agent_pos
+
+        # distance from center
+        dist = distance(agent_pos, (cx, cy))
+
+        # if inside safe zone → no penalty
+        if dist <= cfg.CENTER_RADIUS:
+            return 0.0
+        
+        # if outside → penalty proportional to how far outside
+        # excess_dist = dist - cfg.CENTER_RADIUS
+
+        # simple linear penalty:
+        return cfg.REWARD_CENTER_OUT
+
+    def center_distance_penalty_multiplier(self, agent_pos):
+        cx, cy = cfg.ARENA_WIDTH / 2, cfg.ARENA_HEIGHT / 2
+
+        # distance from center
+        dist = distance(agent_pos, (cx, cy))
+
+        # simple linear penalty:
+        return 1.0 - (dist / max(cx, cy)) * 0.5
+
     # Return observation, reward, game done status, and game info
     def step(self, action: int) -> Tuple[Dict, float, bool, Dict]:
         if self.done:
@@ -101,6 +127,9 @@ class GameEnv:
             # Penalize proximity to arrows
             if dist < cfg.VISION_RADIUS:
                 reward -= cfg.REWARD_MIN_DIST_ALPHA * (1 / man_dist)
+        
+        # reward -= self.center_distance_penalty(agent_pos)
+        reward *= self.center_distance_penalty_multiplier(agent_pos)
         
         self.time_alive += 1
         

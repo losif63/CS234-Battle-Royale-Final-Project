@@ -37,3 +37,9 @@ REWARD_MIN_DIST_ALPHA = 2.5  # Optional: negative reward for proximity
 REWARD_CENTER_ALPHA = 0.1
 WALL_PENALTY_ALPHA = 5 * REWARD_MIN_DIST_ALPHA
 
+
+# Threshold
+WALL_THRESHOLD = 20
+COS_THRESHOLD = 0.7 # 0.9~1.0 heading toward agent | 0.5 ~ 0.7 partially heading toward agent | 
+CENTER_RADIUS = 120
+REWARD_CENTER_OUT = 0.02

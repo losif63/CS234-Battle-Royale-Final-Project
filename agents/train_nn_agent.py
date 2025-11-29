@@ -14,7 +14,7 @@ class ReplayBuffer():
         self.actions = deque()
         self.rewards = deque()
         self.next_obs = deque()
-        self.max_capacity = 5000
+        self.max_capacity = 10000
         return
 
     def __len__(self):

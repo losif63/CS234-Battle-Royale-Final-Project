@@ -8,13 +8,15 @@ import argparse
 import torch
 from collections import deque
 
+SEED = 42
+
 class ReplayBuffer():
     def __init__(self):
         self.obs = deque()
         self.actions = deque()
         self.rewards = deque()
         self.next_obs = deque()
-        self.max_capacity = 10000
+        self.max_capacity = 20000
         return
 
     def __len__(self):
@@ -142,6 +144,8 @@ def main(args):
 
 
 if __name__ == "__main__":
+    random.seed(SEED)
+    torch.manual_seed(SEED)
     parser = argparse.ArgumentParser()
     parser.add_argument('--render', '-r', action='store_true', default=False, help='Whether to render the training process or not')
     args = parser.parse_args()

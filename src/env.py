@@ -67,7 +67,7 @@ class GameEnv:
         return 1.0 - (dist / max_dist) * 0.7
 
     # Return observation, reward, game done status, and game info
-    def step(self, action: int) -> Tuple[Dict, float, bool, Dict]:
+    def step(self, action: int) -> Tuple[Dict, float, bool]:
         if self.done:
             # If already done, return zero reward
             return ({"observation": self.get_obs(), "info": {}}, 0.0, self.done, {})
@@ -89,7 +89,7 @@ class GameEnv:
         self.agent.move(dx, dy, cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
         
         if random.random() < cfg.ARROW_SPAWN_RATE and len(self.arrows) < cfg.ARROW_MAX_NUMBER:
-            x, y, vx, vy = spawn_arrow(
+            x, y, speed, angle = spawn_arrow(
                 cfg.ARENA_WIDTH,
                 cfg.ARENA_HEIGHT,
                 cfg.ARROW_SPEED_MIN,
@@ -97,8 +97,7 @@ class GameEnv:
                 self.agent.x,
                 self.agent.y
             )
-            self.arrows.append(Arrow(x, y, vx, vy, cfg.ARROW_RADIUS)
-)
+            self.arrows.append(Arrow(x, y, speed, angle, cfg.ARROW_RADIUS))
 
         # Update arrows
         for arrow in self.arrows:
@@ -139,6 +138,63 @@ class GameEnv:
         obs = self.get_obs()
         
         return (obs, reward, self.done)
+    
+    # Step function for mdp
+    def step2(self, action: int) -> Tuple[Dict, float, bool]:
+        if self.done:
+            # If already done, return zero reward
+            return ({"observation": self.get_obs2(), "info": {}}, 0.0, self.done, {})
+        
+        # Execute agent action
+        action_str = self.ACTIONS[action]
+        dx, dy = 0.0, 0.0
+        
+        if action_str == "UP":
+            dy -= cfg.AGENT_SPEED
+        elif action_str == "DOWN":
+            dy += cfg.AGENT_SPEED
+        elif action_str == "LEFT":
+            dx -= cfg.AGENT_SPEED
+        elif action_str == "RIGHT":
+            dx += cfg.AGENT_SPEED
+        # "STAY" -> dx, dy remain 0
+        
+        self.agent.move(dx, dy, cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
+        
+        if random.random() < cfg.ARROW_SPAWN_RATE and len(self.arrows) < cfg.ARROW_MAX_NUMBER:
+            x, y, speed, angle = spawn_arrow(
+                cfg.ARENA_WIDTH,
+                cfg.ARENA_HEIGHT,
+                cfg.ARROW_SPEED_MIN,
+                cfg.ARROW_SPEED_MAX,
+                self.agent.x,
+                self.agent.y
+            )
+            self.arrows.append(Arrow(x, y, speed, angle, cfg.ARROW_RADIUS))
+
+        # Update arrows
+        for arrow in self.arrows:
+            arrow.update()
+        
+        # Remove out-of-bounds arrows
+        self.arrows = [
+            arrow for arrow in self.arrows
+            if not arrow.is_out_of_bounds(cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
+        ]
+
+        agent_pos = self.agent.get_position()
+        for arrow in self.arrows:
+            dist = distance(agent_pos, arrow.get_position())    
+            if dist < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
+                self.done = True
+                break
+
+        # Reward is precomputed for MDP
+        reward = None
+        
+        obs = self.get_obs2()
+        
+        return (obs, reward, self.done)
 
     # Get observations
     # observation -> Pytorch vector
@@ -168,7 +224,22 @@ class GameEnv:
 
         return obs
     
-    def render(self, view: bool = True):
+    # Observation vector for mdp
+    # Returns the arrows as they are
+    def get_obs2(self) -> List[Arrow]:
+        agent_pos = self.agent.get_position()
+        visible_arrows = []        
+        # Filter arrows by vision radius
+        for arrow in self.arrows:
+            arrow_position = arrow.get_position()
+            diff_x = round(arrow_position[0] - agent_pos[0])
+            diff_y = round(arrow_position[1] - agent_pos[1])
+            dist = math.sqrt(diff_x ** 2 + diff_y ** 2)
+            if dist <= cfg.VISION_RADIUS:
+                visible_arrows.append(arrow)        
+        return visible_arrows
+    
+    def render(self, view: bool=True, step: int=0):
         if not view:
             return
         
@@ -177,6 +248,7 @@ class GameEnv:
             self.screen = pygame.display.set_mode((cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT))
             pygame.display.set_caption(cfg.WINDOW_TITLE)
             self.clock = pygame.time.Clock()
+            self.font = pygame.font.Font(None, 36)  # Default font, size 36
             self.initialized_render = True
         
         # Handle pygame events (keep window responsive)
@@ -208,7 +280,8 @@ class GameEnv:
         for arrow in self.arrows:
             x, y = int(arrow.x), int(arrow.y)
             # Draw as a small triangle pointing in direction of motion
-            angle = math.atan2(arrow.vy, arrow.vx)
+            vx, vy = arrow.get_velocity()
+            angle = math.atan2(vy, vx)
             size = arrow.radius * 1.5
             # Triangle pointing in velocity direction
             # Tip of arrow at front, base at back
@@ -234,6 +307,10 @@ class GameEnv:
             (int(self.agent.x), int(self.agent.y)),
             int(self.agent.radius)
         )
+        
+        # Draw frame number
+        frame_text = self.font.render(f"Frame: {step}", True, (255, 255, 255))
+        self.screen.blit(frame_text, (10, 10))
         
         pygame.display.flip()
         self.clock.tick(cfg.FPS)

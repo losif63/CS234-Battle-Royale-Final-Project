@@ -2,6 +2,7 @@
 # Created: November 13th
 from dataclasses import dataclass
 from typing import Tuple
+import math
 
 
 @dataclass
@@ -27,13 +28,13 @@ class Agent:
 class Arrow:
     x: float
     y: float
-    vx: float
-    vy: float
+    speed: int
+    angle: float
     radius: float
     
     def update(self):
-        self.x += self.vx
-        self.y += self.vy
+        self.x += self.speed * math.cos(self.angle * math.pi / 180.0)
+        self.y -= self.speed * math.sin(self.angle * math.pi / 180.0)
     
     # Check if arrow is out of arena
     # If arrow goes out of arena, it can later be removed from the game
@@ -46,5 +47,5 @@ class Arrow:
         return (self.x, self.y)
     
     def get_velocity(self) -> Tuple[float, float]:
-        return (self.vx, self.vy)
+        return (self.speed * math.cos(self.angle * math.pi / 180.0), -self.speed * math.sin(self.angle * math.pi / 180.0))
 

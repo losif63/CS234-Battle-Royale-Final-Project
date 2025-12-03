@@ -54,18 +54,13 @@ def main():
             current_action = 0
         
         # Step environment
-        observation, reward, done, info = env.step(current_action)
+        observation, reward, done = env.step(current_action)
         
         # Render
         env.render(view=True)
         
-        # Print score periodically
-        if info.get("time_alive", 0) % 60 == 0 and info.get("time_alive", 0) > 0:
-            print(f"Time alive: {info['time_alive'] // 60} seconds, Arrows in environment: {info.get('num_arrows', 0)}")
-        
         # Check if done (collision)
         if done:
-            print(f"Game Over! Final time alive: {info.get('time_alive', 0)}")
             pygame.time.wait(2000)
             
             # Uncomment below code to Restart after game over

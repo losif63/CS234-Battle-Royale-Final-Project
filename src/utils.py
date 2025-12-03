@@ -16,60 +16,52 @@ def manhattan_distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> floa
 def spawn_arrow(
     arena_width: int,
     arena_height: int,
-    speed_min: float,
-    speed_max: float,
+    speed_min: int,
+    speed_max: int,
     agent_x: float,
     agent_y: float,
     toward_agent_prob=0.2
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, int, float]:
     # Choose a random edge (0=top, 1=right, 2=bottom, 3=left)
     edge = random.randint(0, 3)
-
     agent_prob = random.random() 
 
+    speed = random.randint(speed_min, speed_max)
     if edge == 0:  # Top
         x = random.uniform(0, arena_width)
         y = 0
         if agent_prob < toward_agent_prob:
-            vx = agent_x - x
-            vy = agent_y - y
+            angle = math.atan2(y - agent_y, agent_x - x) * 180.0 / math.pi  # Convert radians to degrees
         else:
-            vx = random.uniform(-2.0, 2.0)
-            vy = random.uniform(1.0, 3.0) # Arrow should point downward
+            angle = random.random() * 120.0 + 210.0 # Arrow should point downward
     elif edge == 1:  # Right
         x = arena_width
         y = random.uniform(0, arena_height)
         if agent_prob < toward_agent_prob:
-            vx = agent_x - x
-            vy = agent_y - y
+            angle = math.atan2(y - agent_y, agent_x - x) * 180.0 / math.pi  # Convert radians to degrees
         else:
-            vx = random.uniform(-3.0, -1.0) # Arrow shuld point left
-            vy = random.uniform(-2.0, 2.0)
+            angle = random.random() * 120.0 + 120.0 # Arrow shuld point left
     elif edge == 2:  # Bottom
         x = random.uniform(0, arena_width)
         y = arena_height
         if agent_prob < toward_agent_prob:
-            vx = agent_x - x
-            vy = agent_y - y
+            angle = math.atan2(y - agent_y, agent_x - x) * 180.0 / math.pi  # Convert radians to degrees
         else:
-            vx = random.uniform(-2.0, 2.0)
-            vy = random.uniform(-3.0, -1.0) # ARrow should point up
+            angle = random.random() * 120.0 + 30.0 # Arrow should point up
     else:  # Left
         x = 0
         y = random.uniform(0, arena_height)
         if agent_prob < toward_agent_prob:
-            vx = agent_x - x
-            vy = agent_y - y
+            angle = math.atan2(y - agent_y, agent_x - x) * 180.0 / math.pi  # Convert radians to degrees
         else:
-            vx = random.uniform(1.0, 3.0) # Arrow should point right
-            vy = random.uniform(-2.0, 2.0) 
-    
-    # Normalize and scale to random speed
-    v_norm = math.sqrt(vx ** 2 + vy ** 2)
-    speed = random.uniform(speed_min, speed_max)
-    gain = speed / v_norm
-    
-    return (x, y, vx * gain, vy * gain)
+            angle = random.random() * 120.0 + 300.0 # Arrow should point right
+    # Normalize angle to [0, 360)
+    if angle < 0:
+        angle += 360.0
+    if angle >= 360.0:
+        angle -= 360.0
+            
+    return (x, y, speed, angle)
 
 def detect_object_collision(
     p1, r1, p2, r2,

@@ -39,7 +39,7 @@ def main(args):
         
         # Render
         if args.render:
-            env.render(view=True)
+            env.render(view=True, step=step)
         obs = next_obs
 
     print("Finished.")

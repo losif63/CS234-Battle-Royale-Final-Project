@@ -239,7 +239,7 @@ class GameEnv:
                 visible_arrows.append(arrow)        
         return visible_arrows
     
-    def render(self, view: bool = True):
+    def render(self, view: bool=True, step: int=0):
         if not view:
             return
         
@@ -248,6 +248,7 @@ class GameEnv:
             self.screen = pygame.display.set_mode((cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT))
             pygame.display.set_caption(cfg.WINDOW_TITLE)
             self.clock = pygame.time.Clock()
+            self.font = pygame.font.Font(None, 36)  # Default font, size 36
             self.initialized_render = True
         
         # Handle pygame events (keep window responsive)
@@ -306,6 +307,10 @@ class GameEnv:
             (int(self.agent.x), int(self.agent.y)),
             int(self.agent.radius)
         )
+        
+        # Draw frame number
+        frame_text = self.font.render(f"Frame: {step}", True, (255, 255, 255))
+        self.screen.blit(frame_text, (10, 10))
         
         pygame.display.flip()
         self.clock.tick(cfg.FPS)

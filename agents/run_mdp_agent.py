@@ -7,6 +7,7 @@ import pygame
 import argparse
 import numpy as np
 import json
+import math
 from typing import List, Dict, Tuple
 from src.objects import Arrow
 from tqdm import tqdm
@@ -41,29 +42,62 @@ def main(args):
             cur_state = (0, 0, 0, 0)
             cur_state_idx = state_space[cur_state]
             q_values = qstar[cur_state_idx, :]
-            action = np.argmax(q_values, axis=-1)
+            action = np.argmax(q_values)
         else:
             q_values = []
             for arrow in obs:
                 arr_x, arr_y = arrow.get_position()
                 arr_x = round(arr_x - agent_pos[0])
                 arr_y = round(arr_y - agent_pos[1])
-                rounded_angle = round(arrow.angle / 10) * 10 % 360
-                cur_state = (arrow.speed, rounded_angle, arr_x, arr_y)
-                cur_state_idx = state_space[cur_state]
-                q_values.append(qstar[cur_state_idx, :])
-            q_values = np.stack(q_values, axis=-1)
-
-            # Try out both sum and min
-            q_min = np.min(q_values, axis=0)
-            action = np.argmax(q_min, axis=-1)            
+                
+                # Check if arrow is within vision range
+                dist = math.sqrt(arr_x ** 2 + arr_y ** 2)
+                if dist > vision_range:
+                    # Arrow out of vision, use terminal state
+                    cur_state = (0, 0, 0, 0)
+                elif dist < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
+                    # Collision state - use terminal state
+                    cur_state = (0, 0, 0, 0)
+                else:
+                    # Round angle to match MDP state space (0, 10, 20, ..., 350)
+                    rounded_angle = round(arrow.angle / 10) * 10
+                    if rounded_angle < 0:
+                        rounded_angle += 360
+                    rounded_angle = rounded_angle % 360
+                    
+                    # Clamp position to vision range
+                    arr_x = max(-vision_range, min(vision_range, arr_x))
+                    arr_y = max(-vision_range, min(vision_range, arr_y))
+                    
+                    cur_state = (arrow.speed, rounded_angle, arr_x, arr_y)
+                
+                # Look up state (with error handling)
+                if cur_state in state_space:
+                    cur_state_idx = state_space[cur_state]
+                    q_values.append(qstar[cur_state_idx, :])
+                else:
+                    # State not found, use terminal state
+                    cur_state_idx = state_space[(0, 0, 0, 0)]
+                    q_values.append(qstar[cur_state_idx, :])
+            
+            if len(q_values) > 0:
+                q_values = np.stack(q_values, axis=0)  # Shape: (num_arrows, num_actions)
+                # q_min = np.min(q_values, axis=0)  # Shape: (num_actions,)
+                # action = np.argmax(q_min)  # Scalar action index
+                q_sum = np.sum(q_values, axis=0)  # Shape: (num_actions,)
+                action = np.argmax(q_sum)  # Scalar action index
+            else:
+                # No valid arrows, use terminal state
+                cur_state_idx = state_space[(0, 0, 0, 0)]
+                q_values = qstar[cur_state_idx, :]
+                action = np.argmax(q_values)            
 
         obs, _, done = env.step2(action)
         num_steps += 1
         
         # Render
         if args.render:
-            env.render(view=True)        
+            env.render(view=True, step=num_steps)        
         # Check if done
         if done:
             print(f"\nCollision detected at step {num_steps}!")

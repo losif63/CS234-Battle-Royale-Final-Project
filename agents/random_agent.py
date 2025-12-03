@@ -31,7 +31,7 @@ def main(args):
         
         # Render
         if args.render:
-            env.render(view=True)
+            env.render(view=True, step=num_steps)
         
         # Print progress
         if num_steps % 50 == 0:

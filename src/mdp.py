@@ -11,7 +11,7 @@ import json
 class MDP():
     def __init__(self, vision_range: int) -> None:
         self.vision_range = vision_range
-        self.gamma = 0.9
+        self.gamma = 0.995
         self.state_space: Dict[Tuple[int, int, int, int], int] = {}
         self.state_space[(0, 0, 0, 0)] = 0
         idx = 1
@@ -35,63 +35,110 @@ class MDP():
         self.transition: np.ndarray = np.zeros((len(self.state_space), len(self.action_space)), dtype=np.uint32)
         self.value: np.ndarray = np.zeros((len(self.state_space)))
         self.rewards: np.ndarray = np.zeros((len(self.state_space), len(self.action_space)))
+        
+        # Initialize terminal state values
+        for speed, angle, x, y in self.state_space:
+            state_idx = self.state_space[(speed, angle, x, y)]
+            if math.sqrt(x ** 2 + y ** 2) < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
+                # Collision terminal state - value is reward / (1 - gamma) for absorbing state
+                self.value[state_idx] = -50.0 / (1.0 - self.gamma)
+            elif speed == 0 and angle == 0:
+                # Safe terminal state (no arrow) - value is reward / (1 - gamma)
+                self.value[state_idx] = 0.1 / (1.0 - self.gamma)
 
         for speed, angle, x, y in tqdm(self.state_space):
             state_idx = self.state_space[(speed, angle, x, y)]
             for action in self.action_space:
                 action_idx = self.action_space[action]
                 # Handle terminal states first
-                # Collision with arrow
+                # Collision with arrow - terminal/absorbing state
                 if math.sqrt(x ** 2 + y ** 2) < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
                     self.transition[state_idx, action_idx] = state_idx
-                    self.value[state_idx] = 0.0
+                    self.rewards[state_idx, action_idx] = -50.0
                     continue
-                # Arrow out of vision range
+                # Arrow out of vision range - safe terminal state
                 elif speed == 0 and angle == 0:
                     self.transition[state_idx, action_idx] = state_idx
-                    self.value[state_idx] = 0.0
+                    self.rewards[state_idx, action_idx] = 0.1
                     continue
 
                 # Normal states
-                # Calculate new state
+                # Calculate new state: arrow moves first, then agent moves
+                # Arrow position relative to agent: arrow moves in its direction
                 new_x = round(x + speed * math.cos(angle * math.pi / 180))
                 new_y = round(y - speed * math.sin(angle * math.pi / 180))
+                # Agent movement: if agent moves, relative position changes oppositely
                 if action == 'UP':
-                    new_y += cfg.AGENT_SPEED
+                    new_y += cfg.AGENT_SPEED  # Agent moves up, arrow's relative y increases
                 elif action == 'DOWN':
-                    new_y -= cfg.AGENT_SPEED
+                    new_y -= cfg.AGENT_SPEED  # Agent moves down, arrow's relative y decreases
                 elif action == 'LEFT':
-                    new_x += cfg.AGENT_SPEED
+                    new_x += cfg.AGENT_SPEED  # Agent moves left, arrow's relative x increases
                 elif action == 'RIGHT':
-                    new_x -= cfg.AGENT_SPEED
+                    new_x -= cfg.AGENT_SPEED  # Agent moves right, arrow's relative x decreases
 
-                # Next state is out of vision range
+                # Check if next state is out of vision range
                 if math.sqrt(new_x ** 2 + new_y ** 2) > self.vision_range:
-                    new_x, new_y = 0, 0
-                    next_state = (0, 0, new_x, new_y)
+                    next_state = (0, 0, 0, 0)
                     next_state_idx = self.state_space[next_state]
                     self.transition[state_idx, action_idx] = next_state_idx
                     self.rewards[state_idx, action_idx] = 0.1
-                # Next state has collision
+                # Check if next state has collision
                 elif math.sqrt(new_x ** 2 + new_y ** 2) < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS: 
-                    next_state = (speed, angle, new_x, new_y)
+                    # Collision state - find or create terminal state
+                    # Use a collision marker state (same speed/angle but collision position)
+                    # For simplicity, transition to terminal state
+                    next_state = (0, 0, 0, 0)  # Use terminal state for collision
                     next_state_idx = self.state_space[next_state]
                     self.transition[state_idx, action_idx] = next_state_idx
-                    self.rewards[state_idx, action_idx] = -10.0
+                    self.rewards[state_idx, action_idx] = -50.0
                 else:
-                    next_state = (speed, angle, new_x, new_y)
-                    next_state_idx = self.state_space[next_state]
-                    self.transition[state_idx, action_idx] = next_state_idx
-                    self.rewards[state_idx, action_idx] = 0.1
+                    # Normal transition - need to find matching state
+                    # Round to ensure we find a valid state
+                    new_x = max(-self.vision_range, min(self.vision_range, new_x))
+                    new_y = max(-self.vision_range, min(self.vision_range, new_y))
+                    # Check if within vision circle
+                    if math.sqrt(new_x ** 2 + new_y ** 2) <= self.vision_range:
+                        next_state = (speed, angle, new_x, new_y)
+                        if next_state in self.state_space:
+                            next_state_idx = self.state_space[next_state]
+                            self.transition[state_idx, action_idx] = next_state_idx
+                            self.rewards[state_idx, action_idx] = 0.1
+                        else:
+                            # State not in space, transition to terminal
+                            next_state = (0, 0, 0, 0)
+                            next_state_idx = self.state_space[next_state]
+                            self.transition[state_idx, action_idx] = next_state_idx
+                            self.rewards[state_idx, action_idx] = 0.1
+                    else:
+                        # Out of vision range
+                        next_state = (0, 0, 0, 0)
+                        next_state_idx = self.state_space[next_state]
+                        self.transition[state_idx, action_idx] = next_state_idx
+                        self.rewards[state_idx, action_idx] = 0.1
                     
     def value_iteration(self) -> None:
         error = float('inf')
-        threshold = 1e-4
+        threshold = 1e-3
         epoch = 0
+        
+        # Identify terminal states (collision states and safe terminal states)
+        terminal_states = set()
+        for speed, angle, x, y in self.state_space:
+            state_idx = self.state_space[(speed, angle, x, y)]
+            if math.sqrt(x ** 2 + y ** 2) < cfg.AGENT_RADIUS + cfg.ARROW_RADIUS:
+                terminal_states.add(state_idx)
+            elif speed == 0 and angle == 0:
+                terminal_states.add(state_idx)
+        
         while error > threshold:
             epoch += 1
             new_value = self.rewards + self.gamma * self.value[self.transition]
             new_value_star = np.max(new_value, axis=-1)
+            
+            # Don't update terminal states - they're absorbing
+            for term_idx in terminal_states:
+                new_value_star[term_idx] = self.value[term_idx]
 
             error = np.max(np.abs(self.value - new_value_star))
             print(f"Epoch {epoch} - Error {error}")

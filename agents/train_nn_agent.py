@@ -7,7 +7,7 @@ import pygame
 import argparse
 import torch
 from collections import deque
-
+import src.config as cfg
 SEED = 42
 
 class ReplayBuffer():
@@ -118,16 +118,6 @@ def main(args):
                 loss.backward()
                 optimizer.step()
             
-            # q_sa = q_values[action]
-            # with torch.no_grad():
-            #     if done:
-            #         target = reward
-            #     else:
-            #         target = reward + gamma * torch.max(q_net(next_obs))
-            # loss = (target - q_sa) ** 2
-            # loss.backward()
-            # optimizer.step()
-            
 
         # Decay epsilon for epsilon-greedy
         epsilon = max(epsilon_min, epsilon * epsilon_decay)
@@ -140,7 +130,7 @@ def main(args):
     print("\nTraining finished.")
     env.close()
 
-    torch.save(q_net.state_dict(), "q_network.pt")
+    torch.save(q_net.state_dict(), f"q_network_{cfg.VISION_RADIUS}.pt")
 
 
 if __name__ == "__main__":

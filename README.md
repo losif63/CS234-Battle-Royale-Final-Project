@@ -1,7 +1,10 @@
 # AA228-CS238-Ninja-Agent-Final-Project
 
 <p align="center">
-  <img src="Demo.gif" alt="Demo" width="600">
+  <figure>
+    <img src="Demo.gif" alt="Demo" width="600">
+    <figcaption><em>Demo of the MDP Agent evading arrows in a partially observable environment.</em></figcaption>
+  </figure>
 </p>
 This repository contains the code for the final project "The Art of Evasion: Training a Ninja Agent under Partial Observability".
 

@@ -3,17 +3,35 @@
 <p align="center">
   <img src="Demo.gif" alt="Demo" width="600">
 </p>
+This repository contains the code for the final project "The Art of Evasion: Training a Ninja Agent under Partial Observability".
 
-## Running the game
+## Project Members
+* Jaduk Suh
+* Juhyun Jung
+
+## Install Dependencies
+```
+pip install -r requirements.txt
+```
+
+## Playing the game
 ```
 python -m src.main
 ```
 
 ## Running the random agent
 ```
-python -m agents.random_agent
-
-# (Render random agent behavior)
 python -m agents.random_agent -r
 ```
 
+Note that the -r flag enables rendering. Without it, the game will run but it will not be rendered.
+
+## Running the DQN agent
+```
+python -m agents.run_nn_agent -r
+```
+
+## Running the MDP agent
+```
+python -m agents.run_mdp_agent -r
+```

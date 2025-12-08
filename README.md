@@ -1,6 +1,6 @@
 # AA228-CS238-Ninja-Agent-Final-Project
 
-
+![Demo](demo.gif)
 ## Running the game
 ```
 python -m src.main

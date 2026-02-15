@@ -51,3 +51,6 @@ WALL_THRESHOLD = 20
 COS_THRESHOLD = 0.7
 CENTER_RADIUS = 120
 REWARD_CENTER_OUT = 0.02
+
+# Bullet buffer size (max simultaneous bullets in flight)
+MAX_BULLETS = 30

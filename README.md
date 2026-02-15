@@ -7,14 +7,13 @@ A simple 2-player local battle royale: move around the arena, pick up ammo (gree
 From the project root:
 
 ```bash
-pip install -r requirements.txt
-python -m src.main
+uv run python -m src.main
 ```
 
 To watch two random agents play instead:
 
 ```bash
-python -m agents.random_agent --render
+uv run python -m agents.random_agent --render
 ```
 
 ## Keybindings

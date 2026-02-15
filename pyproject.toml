@@ -1,0 +1,11 @@
+[project]
+name = "battle-royale"
+version = "0.1.0"
+description = "A simple 2-player local battle royale game"
+requires-python = ">=3.10"
+dependencies = [
+    "pygame>=2.5.0",
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+]

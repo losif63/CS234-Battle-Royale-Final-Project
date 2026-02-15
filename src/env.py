@@ -2,21 +2,20 @@
 # Created: November 13th
 import src.config as cfg
 import pygame
-import numpy as np
-from typing import Optional, Dict, Tuple
+from src.objects import Agent, Bullet, AmmoPickup
+from typing import List, Optional, Dict, Tuple
 import random
-from src.utils import spawn_agents_far_apart, spawn_ammo_pickups
+from src.utils import distance, spawn_agents_far_apart, spawn_ammo_pickups
 import math
 
 SEED = 42
 
-# Precomputed velocity vectors for each shoot action (unit vectors * BULLET_SPEED)
-# SHOOT_UP=5, SHOOT_DOWN=6, SHOOT_LEFT=7, SHOOT_RIGHT=8
-SHOOT_VELOCITIES = {
-    5: np.array([0.0, -cfg.BULLET_SPEED], dtype=np.float32),   # UP
-    6: np.array([0.0, cfg.BULLET_SPEED], dtype=np.float32),    # DOWN
-    7: np.array([-cfg.BULLET_SPEED, 0.0], dtype=np.float32),   # LEFT
-    8: np.array([cfg.BULLET_SPEED, 0.0], dtype=np.float32),    # RIGHT
+# Shooting direction to angle in degrees (same convention as Arrow: 0=right, 90=up, 180=left, 270=down)
+SHOOT_ANGLES = {
+    "SHOOT_UP": 90.0,
+    "SHOOT_DOWN": 270.0,
+    "SHOOT_LEFT": 180.0,
+    "SHOOT_RIGHT": 0.0,
 }
 
 
@@ -32,31 +31,31 @@ class GameEnv:
         self.rng.seed(SEED)
         self.initialized_render = False
 
-        # Agent state
-        self.agent_positions = np.array([
-            [cfg.ARENA_WIDTH / 2 - 80, cfg.ARENA_HEIGHT / 2],
-            [cfg.ARENA_WIDTH / 2 + 80, cfg.ARENA_HEIGHT / 2],
-        ], dtype=np.float32)
-        self.agent_ammo = np.zeros(2, dtype=np.int32)
-        self.agent_alive = np.array([True, True])
-
-        # Bullet buffer (fixed-size, tracked by active mask)
-        self.bullet_positions = np.zeros((cfg.MAX_BULLETS, 2), dtype=np.float32)
-        self.bullet_velocities = np.zeros((cfg.MAX_BULLETS, 2), dtype=np.float32)
-        self.bullet_owners = np.zeros(cfg.MAX_BULLETS, dtype=np.int32)
-        self.bullet_active = np.zeros(cfg.MAX_BULLETS, dtype=bool)
-
-        # Ammo pickups
-        self.pickup_positions = np.zeros((cfg.NUM_AMMO_PICKUPS, 2), dtype=np.float32)
-        self.pickup_active = np.zeros(cfg.NUM_AMMO_PICKUPS, dtype=bool)
-
-        # Scalar state
+        # Game state: two agents
+        self.agents: List[Agent] = [
+            Agent(
+                x=cfg.ARENA_WIDTH / 2 - 80,
+                y=cfg.ARENA_HEIGHT / 2,
+                radius=cfg.AGENT_RADIUS,
+                speed=cfg.AGENT_SPEED,
+                ammo=0,
+            ),
+            Agent(
+                x=cfg.ARENA_WIDTH / 2 + 80,
+                y=cfg.ARENA_HEIGHT / 2,
+                radius=cfg.AGENT_RADIUS,
+                speed=cfg.AGENT_SPEED,
+                ammo=0,
+            ),
+        ]
+        self.bullets: List[Bullet] = []
+        self.ammo_pickups: List[AmmoPickup] = []
         self.time_step: int = 0
         self.done: bool = False
-        self.winner: Optional[int] = None
+        self.winner: Optional[int] = None  # 0 or 1 if someone was hit, None if game ongoing
+        self.alive: List[bool] = [True, True]
 
     def reset(self):
-        # Spawn agents
         positions = spawn_agents_far_apart(
             cfg.ARENA_WIDTH,
             cfg.ARENA_HEIGHT,
@@ -66,77 +65,60 @@ class GameEnv:
             self.rng,
         )
         for i, (x, y) in enumerate(positions):
-            self.agent_positions[i, 0] = x
-            self.agent_positions[i, 1] = y
-        self.agent_ammo[:] = 0
-        self.agent_alive[:] = True
-
-        # Clear bullets
-        self.bullet_active[:] = False
-
-        # Spawn ammo pickups
-        pickups = spawn_ammo_pickups(
+            self.agents[i].x = x
+            self.agents[i].y = y
+            self.agents[i].ammo = 0
+        self.bullets = []
+        self.ammo_pickups = spawn_ammo_pickups(
             cfg.ARENA_WIDTH,
             cfg.ARENA_HEIGHT,
             cfg.NUM_AMMO_PICKUPS,
             cfg.AMMO_PICKUP_RADIUS,
-            [tuple(self.agent_positions[0]), tuple(self.agent_positions[1])],
+            [self.agents[0].get_position(), self.agents[1].get_position()],
             cfg.AGENT_RADIUS,
             self.rng,
         )
-        for i, p in enumerate(pickups):
-            self.pickup_positions[i, 0] = p.x
-            self.pickup_positions[i, 1] = p.y
-        self.pickup_active[:len(pickups)] = True
-        self.pickup_active[len(pickups):] = False
-
         self.time_step = 0
         self.done = False
         self.winner = None
+        self.alive = [True, True]
 
     def _apply_action(self, agent_id: int, action: int):
+        agent = self.agents[agent_id]
         if action < 0 or action >= self.NUM_ACTIONS:
             action = 0
+        action_str = self.ACTIONS[action]
 
-        # Movement
-        if action <= 4:
-            dx, dy = 0.0, 0.0
-            if action == 1:    # UP
-                dy = -cfg.AGENT_SPEED
-            elif action == 2:  # DOWN
-                dy = cfg.AGENT_SPEED
-            elif action == 3:  # LEFT
-                dx = -cfg.AGENT_SPEED
-            elif action == 4:  # RIGHT
-                dx = cfg.AGENT_SPEED
+        # Move
+        dx, dy = 0.0, 0.0
+        if action_str == "UP":
+            dy -= cfg.AGENT_SPEED
+        elif action_str == "DOWN":
+            dy += cfg.AGENT_SPEED
+        elif action_str == "LEFT":
+            dx -= cfg.AGENT_SPEED
+        elif action_str == "RIGHT":
+            dx += cfg.AGENT_SPEED
 
-            self.agent_positions[agent_id, 0] += dx
-            self.agent_positions[agent_id, 1] += dy
-
-            # Clamp to arena
-            self.agent_positions[agent_id, 0] = np.clip(
-                self.agent_positions[agent_id, 0],
-                cfg.AGENT_RADIUS, cfg.ARENA_WIDTH - cfg.AGENT_RADIUS,
-            )
-            self.agent_positions[agent_id, 1] = np.clip(
-                self.agent_positions[agent_id, 1],
-                cfg.AGENT_RADIUS, cfg.ARENA_HEIGHT - cfg.AGENT_RADIUS,
-            )
+        if action_str in ("STAY", "UP", "DOWN", "LEFT", "RIGHT"):
+            agent.move(dx, dy, cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
             return
 
-        # Shoot (actions 5-8), only if has ammo
-        if action in SHOOT_VELOCITIES and self.agent_ammo[agent_id] > 0:
-            # Find first inactive bullet slot
-            inactive = ~self.bullet_active
-            if not inactive.any():
-                return  # buffer full, skip shot
-
-            slot = np.argmax(inactive)
-            self.bullet_positions[slot] = self.agent_positions[agent_id]
-            self.bullet_velocities[slot] = SHOOT_VELOCITIES[action]
-            self.bullet_owners[slot] = agent_id
-            self.bullet_active[slot] = True
-            self.agent_ammo[agent_id] -= 1
+        # Shoot (only if has ammo)
+        if action_str in SHOOT_ANGLES and agent.ammo > 0:
+            angle = SHOOT_ANGLES[action_str]
+            # Spawn bullet at agent center
+            self.bullets.append(
+                Bullet(
+                    x=agent.x,
+                    y=agent.y,
+                    speed=cfg.BULLET_SPEED,
+                    angle=angle,
+                    radius=cfg.BULLET_RADIUS,
+                    owner_id=agent_id,
+                )
+            )
+            agent.ammo -= 1
 
     def step(
         self, action_0: int, action_1: int
@@ -145,65 +127,53 @@ class GameEnv:
             obs = self.get_obs()
             return (obs, (0.0, 0.0), self.done, self.get_info())
 
-        # Apply both agents' actions
-        if self.agent_alive[0]:
+        # Apply both agents' actions (move or shoot)
+        if self.alive[0]:
             self._apply_action(0, action_0)
-        if self.agent_alive[1]:
+        if self.alive[1]:
             self._apply_action(1, action_1)
 
-        # Ammo pickups: check distance from each agent to each active pickup
-        for agent_id in range(2):
-            if not self.agent_alive[agent_id]:
+        # Ammo pickups: if agent overlaps pickup, gain ammo and remove pickup
+        for agent_id in (0, 1):
+            if not self.alive[agent_id]:
                 continue
-            active_mask = self.pickup_active.copy()
-            if not active_mask.any():
-                continue
+            pos = self.agents[agent_id].get_position()
+            to_remove = []
+            for p in self.ammo_pickups:
+                if distance(pos, p.get_position()) < cfg.AGENT_RADIUS + cfg.AMMO_PICKUP_RADIUS:
+                    self.agents[agent_id].ammo += cfg.AMMO_PER_PICKUP
+                    to_remove.append(p)
+            for p in to_remove:
+                self.ammo_pickups.remove(p)
 
-            # Distance from this agent to all pickups
-            diff = self.pickup_positions - self.agent_positions[agent_id]  # (NUM_PICKUPS, 2)
-            dists = np.sqrt(np.sum(diff ** 2, axis=1))  # (NUM_PICKUPS,)
-            collected = active_mask & (dists < cfg.AGENT_RADIUS + cfg.AMMO_PICKUP_RADIUS)
-            num_collected = collected.sum()
-            if num_collected > 0:
-                self.agent_ammo[agent_id] += int(num_collected) * cfg.AMMO_PER_PICKUP
-                self.pickup_active[collected] = False
-
-        # Update bullet positions
-        active = self.bullet_active
-        if active.any():
-            self.bullet_positions[active] += self.bullet_velocities[active]
+        # Update bullets
+        for bullet in self.bullets:
+            bullet.update()
 
         # Remove out-of-bounds bullets
-        if active.any():
-            margin = cfg.BULLET_RADIUS * 2
-            oob = (
-                (self.bullet_positions[:, 0] < -margin) |
-                (self.bullet_positions[:, 0] > cfg.ARENA_WIDTH + margin) |
-                (self.bullet_positions[:, 1] < -margin) |
-                (self.bullet_positions[:, 1] > cfg.ARENA_HEIGHT + margin)
-            )
-            self.bullet_active[oob & active] = False
+        self.bullets = [
+            b
+            for b in self.bullets
+            if not b.is_out_of_bounds(cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
+        ]
 
-        # Bullet-agent collision
+        # Bullet–agent collision: bullet hits the *other* agent
         reward_0 = cfg.REWARD_PER_STEP
         reward_1 = cfg.REWARD_PER_STEP
-        active = self.bullet_active
-        if active.any():
-            hit_radius = cfg.AGENT_RADIUS + cfg.BULLET_RADIUS
-            for agent_id in range(2):
-                if not self.agent_alive[agent_id]:
+        for bullet in self.bullets:
+            if self.done:
+                break
+            bpos = bullet.get_position()
+            for agent_id in (0, 1):
+                if not self.alive[agent_id]:
                     continue
-                # Distance from all active bullets to this agent
-                diff = self.bullet_positions[active] - self.agent_positions[agent_id]
-                dists = np.sqrt(np.sum(diff ** 2, axis=1))
-                # Bullets that hit: close enough AND not owned by this agent
-                owners = self.bullet_owners[active]
-                hits = (dists < hit_radius) & (owners != agent_id)
-                if hits.any():
-                    self.agent_alive[agent_id] = False
+                if bullet.owner_id == agent_id:
+                    continue  # can't hit yourself
+                apos = self.agents[agent_id].get_position()
+                if distance(bpos, apos) < cfg.AGENT_RADIUS + cfg.BULLET_RADIUS:
+                    self.alive[agent_id] = False
                     self.done = True
-                    shooter = int(owners[np.argmax(hits)])
-                    self.winner = shooter
+                    self.winner = bullet.owner_id
                     if agent_id == 0:
                         reward_0 = cfg.REWARD_COLLISION
                         reward_1 = cfg.REWARD_HIT_ENEMY
@@ -218,40 +188,31 @@ class GameEnv:
         return (obs, (reward_0, reward_1), self.done, info)
 
     def get_obs(self) -> Dict:
-        """Observation dict with numpy arrays."""
-        active_bullets = self.bullet_active
-        bullet_pos = self.bullet_positions[active_bullets]       # (n_active, 2)
-        bullet_vel = self.bullet_velocities[active_bullets]      # (n_active, 2)
-        bullet_own = self.bullet_owners[active_bullets]          # (n_active,)
-
-        active_pickups = self.pickup_active
-        pickup_pos = self.pickup_positions[active_pickups]       # (n_active, 2)
-
+        """Observation dict with keys 'agent_0', 'agent_1' (each has position, ammo, etc.)."""
         return {
             "agent_0": {
-                "position": self.agent_positions[0].copy(),
-                "ammo": int(self.agent_ammo[0]),
-                "alive": bool(self.agent_alive[0]),
+                "position": self.agents[0].get_position(),
+                "ammo": self.agents[0].ammo,
+                "alive": self.alive[0],
             },
             "agent_1": {
-                "position": self.agent_positions[1].copy(),
-                "ammo": int(self.agent_ammo[1]),
-                "alive": bool(self.agent_alive[1]),
+                "position": self.agents[1].get_position(),
+                "ammo": self.agents[1].ammo,
+                "alive": self.alive[1],
             },
             "bullets": [
-                (bullet_pos[i].copy(), bullet_vel[i].copy(), int(bullet_own[i]))
-                for i in range(len(bullet_pos))
+                (b.get_position(), b.get_velocity(), b.owner_id) for b in self.bullets
             ],
-            "ammo_pickups": [pickup_pos[i].copy() for i in range(len(pickup_pos))],
+            "ammo_pickups": [p.get_position() for p in self.ammo_pickups],
         }
 
     def get_info(self) -> Dict:
         return {
             "time_step": self.time_step,
             "winner": self.winner,
-            "alive": self.agent_alive.tolist(),
-            "num_bullets": int(self.bullet_active.sum()),
-            "num_ammo_pickups": int(self.pickup_active.sum()),
+            "alive": list(self.alive),
+            "num_bullets": len(self.bullets),
+            "num_ammo_pickups": len(self.ammo_pickups),
         }
 
     def render(self, view: bool = True, step: int = 0):
@@ -280,25 +241,20 @@ class GameEnv:
         )
 
         # Ammo pickups
-        for i in range(cfg.NUM_AMMO_PICKUPS):
-            if not self.pickup_active[i]:
-                continue
-            px, py = int(self.pickup_positions[i, 0]), int(self.pickup_positions[i, 1])
+        for p in self.ammo_pickups:
             pygame.draw.circle(
                 self.screen,
                 cfg.COLOR_AMMO_PICKUP,
-                (px, py),
-                int(cfg.AMMO_PICKUP_RADIUS),
+                (int(p.x), int(p.y)),
+                int(p.radius),
             )
 
         # Bullets
-        for i in range(cfg.MAX_BULLETS):
-            if not self.bullet_active[i]:
-                continue
-            x, y = int(self.bullet_positions[i, 0]), int(self.bullet_positions[i, 1])
-            vx, vy = self.bullet_velocities[i]
+        for bullet in self.bullets:
+            x, y = int(bullet.x), int(bullet.y)
+            vx, vy = bullet.get_velocity()
             angle = math.atan2(vy, vx)
-            size = cfg.BULLET_RADIUS * 1.5
+            size = bullet.radius * 1.5
             tip_x = x + size * math.cos(angle)
             tip_y = y + size * math.sin(angle)
             perp = angle + math.pi / 2
@@ -315,17 +271,16 @@ class GameEnv:
 
         # Agents
         colors = [cfg.COLOR_AGENT, cfg.COLOR_AGENT_2]
-        for i in range(2):
-            if not self.agent_alive[i]:
+        for i, agent in enumerate(self.agents):
+            if not self.alive[i]:
                 continue
-            ax, ay = int(self.agent_positions[i, 0]), int(self.agent_positions[i, 1])
             pygame.draw.circle(
                 self.screen,
                 colors[i],
-                (ax, ay),
-                int(cfg.AGENT_RADIUS),
+                (int(agent.x), int(agent.y)),
+                int(agent.radius),
             )
-            ammo_text = self.font.render(f"P{i+1}: {self.agent_ammo[i]}", True, (255, 255, 255))
+            ammo_text = self.font.render(f"P{i+1}: {agent.ammo}", True, (255, 255, 255))
             self.screen.blit(ammo_text, (10, 10 + i * 22))
 
         frame_text = self.font.render(f"Frame: {step}", True, (255, 255, 255))

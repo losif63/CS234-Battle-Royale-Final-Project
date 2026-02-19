@@ -35,6 +35,10 @@ AMMO_PICKUP_RADIUS = 20.0
 AMMO_PER_PICKUP = 10
 NUM_AMMO_PICKUPS = 6
 
+# Wall properties
+WALL_UNITS = 20
+WALL_COLOR = (100, 100, 100)
+
 # Vision / Fog of War (for future use)
 VISION_RADIUS = 150
 

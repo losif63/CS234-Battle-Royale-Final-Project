@@ -1,7 +1,7 @@
 # Author: Jaduk Suh
 # Created: November 13th
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Optional, Tuple
 import math
 
 
@@ -13,13 +13,29 @@ class Agent:
     speed: float
     ammo: int = 0
 
-    def move(self, dx: float, dy: float, arena_width: int, arena_height: int):
+    def move(
+        self,
+        dx: float,
+        dy: float,
+        arena_width: int,
+        arena_height: int,
+        walls: Optional[List["Wall"]] = None,
+    ):
+        old_x, old_y = self.x, self.y
+
         self.x += dx
         self.y += dy
 
         # Ensure agent doesn't go off arena
         self.x = max(self.radius, min(arena_width - self.radius, self.x))
         self.y = max(self.radius, min(arena_height - self.radius, self.y))
+
+        # If colliding with any wall, revert to original position
+        if walls is not None:
+            for wall in walls:
+                if wall.collides_with_circle(self.x, self.y, self.radius):
+                    self.x, self.y = old_x, old_y
+                    return
 
     def get_position(self) -> Tuple[float, float]:
         return (self.x, self.y)
@@ -71,3 +87,26 @@ class AmmoPickup:
     def get_position(self) -> Tuple[float, float]:
         return (self.x, self.y)
 
+
+@dataclass
+class Wall:
+    x: float
+    y: float
+    width_units: int
+    height_units: int
+    unit: int = 20
+
+    def get_xbounds(self) -> Tuple[float, float]:
+        return (self.x, self.x + self.width_units * self.unit)
+
+    def get_ybounds(self) -> Tuple[float, float]:
+        return (self.y, self.y + self.height_units * self.unit)
+
+    def collides_with_circle(self, cx: float, cy: float, radius: float) -> bool:
+        """Return True if the circle (center cx, cy with given radius) overlaps this wall rect."""
+        left, right = self.get_xbounds()
+        top, bottom = self.get_ybounds()
+        closest_x = max(left, min(right, cx))
+        closest_y = max(top, min(bottom, cy))
+        dist_sq = (cx - closest_x) ** 2 + (cy - closest_y) ** 2
+        return dist_sq < radius**2

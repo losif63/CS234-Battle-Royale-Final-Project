@@ -4,7 +4,7 @@ import math
 import random
 from typing import Tuple, List
 
-from src.objects import AmmoPickup
+from src.objects import AmmoPickup, Wall
 
 
 def distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
@@ -74,6 +74,23 @@ def spawn_ammo_pickups(
             continue
         pickups.append(AmmoPickup(x=x, y=y, radius=pickup_radius))
     return pickups
+
+
+def spawn_walls(
+    arena_width: int,
+    arena_height: int,
+    wall_unit: int,
+    rng: random.Random,
+    num_walls: int=4,
+) -> List[Wall]:
+    walls: List[Wall] = []
+    for _ in range(num_walls):
+        x = rng.uniform(0, arena_width)
+        y = rng.uniform(0, arena_height)
+        width = random.randint(1, 3)
+        height = random.randint(1, 3)
+        walls.append(Wall(x=x, y=y, width_units=width, height_units=height, unit=wall_unit))
+    return walls
 
 
 def detect_object_collision(p1, r1, p2, r2) -> bool:

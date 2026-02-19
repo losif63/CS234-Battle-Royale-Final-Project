@@ -395,7 +395,7 @@ class GameEnvV2:
             dx += cfg.AGENT_SPEED
 
         if action_str in ("STAY", "UP", "DOWN", "LEFT", "RIGHT"):
-            agent.move(dx, dy, cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
+            agent.move(dx, dy, cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT, self.walls)
             return
 
         # Shoot (only if has ammo)

@@ -21,6 +21,7 @@ COLOR_VISION = (100, 200, 255)
 # Agent properties
 AGENT_RADIUS = 15.0
 AGENT_SPEED = 5.0
+AGENT_FRICTION = 0.6  # velocity multiplier per step when no input (1.0 = no friction, 0.0 = instant stop)
 
 # Spawn: agents must be at least this far apart
 MIN_AGENT_SPAWN_DISTANCE = 250
@@ -39,7 +40,7 @@ NUM_AMMO_PICKUPS = 6
 VISION_RADIUS = 150
 
 # Reward (for training / evaluation)
-REWARD_PER_STEP = 0.1
+REWARD_PER_STEP = 0.0
 REWARD_COLLISION = -10.0
 REWARD_HIT_ENEMY = 10.0
 REWARD_MIN_DIST_ALPHA = 2.5

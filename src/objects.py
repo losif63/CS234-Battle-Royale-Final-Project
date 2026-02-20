@@ -12,17 +12,32 @@ class Agent:
     radius: float
     speed: float
     ammo: int = 0
+    vx: float = 0.0
+    vy: float = 0.0
+
+    def set_velocity(self, vx: float, vy: float):
+        """Set the agent's velocity (called by actions)."""
+        self.vx = vx
+        self.vy = vy
+
+    def update(self, arena_width: int, arena_height: int):
+        """Move the agent by its current velocity, clamping to arena bounds."""
+        self.x += self.vx
+        self.y += self.vy
+        self.x = max(self.radius, min(arena_width - self.radius, self.x))
+        self.y = max(self.radius, min(arena_height - self.radius, self.y))
 
     def move(self, dx: float, dy: float, arena_width: int, arena_height: int):
         self.x += dx
         self.y += dy
-
-        # Ensure agent doesn't go off arena
         self.x = max(self.radius, min(arena_width - self.radius, self.x))
         self.y = max(self.radius, min(arena_height - self.radius, self.y))
 
     def get_position(self) -> Tuple[float, float]:
         return (self.x, self.y)
+
+    def get_velocity(self) -> Tuple[float, float]:
+        return (self.vx, self.vy)
 
 
 @dataclass

@@ -26,9 +26,9 @@ class GameEnv:
     ]
     NUM_ACTIONS = 9
 
-    def __init__(self):
+    def __init__(self, seed: int | None = None):
         self.rng = random.Random()
-        self.rng.seed(SEED)
+        self.rng.seed(seed if seed is not None else SEED)
         self.initialized_render = False
 
         # Game state: two agents
@@ -89,25 +89,25 @@ class GameEnv:
             action = 0
         action_str = self.ACTIONS[action]
 
-        # Move
-        dx, dy = 0.0, 0.0
-        if action_str == "UP":
-            dy -= cfg.AGENT_SPEED
+        # Set velocity based on action
+        if action_str == "STAY":
+            agent.set_velocity(agent.vx * cfg.AGENT_FRICTION, agent.vy * cfg.AGENT_FRICTION)
+        elif action_str == "UP":
+            agent.set_velocity(0.0, -cfg.AGENT_SPEED)
         elif action_str == "DOWN":
-            dy += cfg.AGENT_SPEED
+            agent.set_velocity(0.0, cfg.AGENT_SPEED)
         elif action_str == "LEFT":
-            dx -= cfg.AGENT_SPEED
+            agent.set_velocity(-cfg.AGENT_SPEED, 0.0)
         elif action_str == "RIGHT":
-            dx += cfg.AGENT_SPEED
+            agent.set_velocity(cfg.AGENT_SPEED, 0.0)
 
         if action_str in ("STAY", "UP", "DOWN", "LEFT", "RIGHT"):
-            agent.move(dx, dy, cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
+            agent.update(cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
             return
 
-        # Shoot (only if has ammo)
+        # Shoot (only if has ammo) — agent keeps current velocity
         if action_str in SHOOT_ANGLES and agent.ammo > 0:
             angle = SHOOT_ANGLES[action_str]
-            # Spawn bullet at agent center
             self.bullets.append(
                 Bullet(
                     x=agent.x,
@@ -119,6 +119,8 @@ class GameEnv:
                 )
             )
             agent.ammo -= 1
+        # Move with current velocity even when shooting
+        agent.update(cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
 
     def step(
         self, action_0: int, action_1: int
@@ -127,14 +129,15 @@ class GameEnv:
             obs = self.get_obs()
             return (obs, (0.0, 0.0), self.done, self.get_info())
 
-        # Apply both agents' actions (move or shoot)
-        if self.alive[0]:
-            self._apply_action(0, action_0)
-        if self.alive[1]:
-            self._apply_action(1, action_1)
+        # Apply both agents' actions in random order (no first-mover advantage)
+        actions = {0: action_0, 1: action_1}
+        order = [0, 1] if self.rng.random() < 0.5 else [1, 0]
+        for agent_id in order:
+            if self.alive[agent_id]:
+                self._apply_action(agent_id, actions[agent_id])
 
-        # Ammo pickups: if agent overlaps pickup, gain ammo and remove pickup
-        for agent_id in (0, 1):
+        # Ammo pickups in random order
+        for agent_id in order:
             if not self.alive[agent_id]:
                 continue
             pos = self.agents[agent_id].get_position()
@@ -157,30 +160,39 @@ class GameEnv:
             if not b.is_out_of_bounds(cfg.ARENA_WIDTH, cfg.ARENA_HEIGHT)
         ]
 
-        # Bullet–agent collision: bullet hits the *other* agent
+        # Bullet–agent collision: check all hits before resolving (no priority)
         reward_0 = cfg.REWARD_PER_STEP
         reward_1 = cfg.REWARD_PER_STEP
+        hit_agents = set()
         for bullet in self.bullets:
-            if self.done:
-                break
             bpos = bullet.get_position()
             for agent_id in (0, 1):
                 if not self.alive[agent_id]:
                     continue
                 if bullet.owner_id == agent_id:
-                    continue  # can't hit yourself
+                    continue
                 apos = self.agents[agent_id].get_position()
                 if distance(bpos, apos) < cfg.AGENT_RADIUS + cfg.BULLET_RADIUS:
-                    self.alive[agent_id] = False
-                    self.done = True
-                    self.winner = bullet.owner_id
-                    if agent_id == 0:
-                        reward_0 = cfg.REWARD_COLLISION
-                        reward_1 = cfg.REWARD_HIT_ENEMY
-                    else:
-                        reward_1 = cfg.REWARD_COLLISION
-                        reward_0 = cfg.REWARD_HIT_ENEMY
-                    break
+                    hit_agents.add(agent_id)
+
+        if hit_agents:
+            self.done = True
+            for agent_id in hit_agents:
+                self.alive[agent_id] = False
+            if len(hit_agents) == 2:
+                # Simultaneous kill — draw (no winner)
+                self.winner = None
+                reward_0 = cfg.REWARD_COLLISION
+                reward_1 = cfg.REWARD_COLLISION
+            else:
+                killed = next(iter(hit_agents))
+                self.winner = 1 - killed
+                if killed == 0:
+                    reward_0 = cfg.REWARD_COLLISION
+                    reward_1 = cfg.REWARD_HIT_ENEMY
+                else:
+                    reward_1 = cfg.REWARD_COLLISION
+                    reward_0 = cfg.REWARD_HIT_ENEMY
 
         self.time_step += 1
         obs = self.get_obs()
@@ -192,11 +204,13 @@ class GameEnv:
         return {
             "agent_0": {
                 "position": self.agents[0].get_position(),
+                "velocity": self.agents[0].get_velocity(),
                 "ammo": self.agents[0].ammo,
                 "alive": self.alive[0],
             },
             "agent_1": {
                 "position": self.agents[1].get_position(),
+                "velocity": self.agents[1].get_velocity(),
                 "ammo": self.agents[1].ammo,
                 "alive": self.alive[1],
             },
@@ -215,7 +229,7 @@ class GameEnv:
             "num_ammo_pickups": len(self.ammo_pickups),
         }
 
-    def render(self, view: bool = True, step: int = 0):
+    def render(self, view: bool = True, step: int = 0, flip: bool = True):
         if not view:
             return
 
@@ -280,22 +294,25 @@ class GameEnv:
                 (int(agent.x), int(agent.y)),
                 int(agent.radius),
             )
-            ammo_text = self.font.render(f"P{i+1}: {agent.ammo}", True, (255, 255, 255))
+            label = "Blue" if i == 0 else "Orange"
+            ammo_text = self.font.render(f"{label}: {agent.ammo}", True, colors[i])
             self.screen.blit(ammo_text, (10, 10 + i * 22))
 
         frame_text = self.font.render(f"Frame: {step}", True, (255, 255, 255))
         self.screen.blit(frame_text, (10, 60))
 
         if self.done and self.winner is not None:
+            winner_label = "Blue" if self.winner == 0 else "Orange"
             win_text = self.font.render(
-                f"Player {self.winner + 1} wins!", True, (255, 255, 0)
+                f"{winner_label} wins!", True, (255, 255, 0)
             )
             self.screen.blit(
                 win_text,
                 (cfg.ARENA_WIDTH // 2 - 80, cfg.ARENA_HEIGHT // 2 - 18),
             )
 
-        pygame.display.flip()
+        if flip:
+            pygame.display.flip()
         self.clock.tick(cfg.FPS)
 
     def close(self):

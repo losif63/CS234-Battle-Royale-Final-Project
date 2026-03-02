@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import copy
+import csv
 import math
 import os
 import random
@@ -42,7 +43,7 @@ ENEMY_POS_NORM = 250.0
 # ---------------------------------------------------------------------------
 # PPO Hyperparameters
 # ---------------------------------------------------------------------------
-ACTION_REPEAT = 4
+ACTION_REPEAT = 3
 MAX_STEPS_PER_EPISODE = 1000
 
 NUM_ENVS = 128
@@ -623,6 +624,18 @@ def train(num_updates: int = DEFAULT_NUM_UPDATES, resume: str | None = None):
     total_env_steps = 0
     wall_start = time.time()
 
+    # CSV logging
+    csv_path = os.path.join(SAVE_DIR, "training_log.csv")
+    csv_file = open(csv_path, "w", newline="")
+    csv_fields = [
+        "update", "wall_time", "total_env_steps", "avg_reward", "avg_ep_length",
+        "kill_rate", "win_rate", "elo", "policy_loss", "value_loss", "entropy",
+        "lr", "fps",
+    ]
+    csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+    csv_writer.writeheader()
+    print(f"Logging training data to {csv_path}")
+
     for update in range(start_update, start_update + num_updates):
         update_start = time.time()
 
@@ -758,6 +771,23 @@ def train(num_updates: int = DEFAULT_NUM_UPDATES, resume: str | None = None):
                 f"ent {loss_info['entropy']:.3f} lr {lr_now:.1e}"
             )
 
+            csv_writer.writerow({
+                "update": update + 1,
+                "wall_time": f"{time.time() - wall_start:.1f}",
+                "total_env_steps": total_env_steps,
+                "avg_reward": f"{avg_reward:.4f}",
+                "avg_ep_length": f"{avg_length:.1f}",
+                "kill_rate": f"{kill_rate:.4f}",
+                "win_rate": f"{win_rate:.4f}",
+                "elo": f"{pool.current_elo:.1f}",
+                "policy_loss": f"{loss_info['policy_loss']:.6f}",
+                "value_loss": f"{loss_info['value_loss']:.6f}",
+                "entropy": f"{loss_info['entropy']:.6f}",
+                "lr": f"{lr_now:.6e}",
+                "fps": f"{fps:.0f}",
+            })
+            csv_file.flush()
+
         # -- Save checkpoint --
         if (update + 1) % SAVE_EVERY == 0:
             path = os.path.join(SAVE_DIR, f"ppo_update_{update + 1}.pt")
@@ -768,6 +798,9 @@ def train(num_updates: int = DEFAULT_NUM_UPDATES, resume: str | None = None):
     final_path = os.path.join(SAVE_DIR, "ppo_final.pt")
     agent.save(final_path)
     print(f"\nTraining done. Final model saved to {final_path}")
+
+    csv_file.close()
+    print(f"Training log saved to {csv_path}")
 
     batched_env.close()
 

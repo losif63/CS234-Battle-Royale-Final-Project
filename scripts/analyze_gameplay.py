@@ -1,620 +1,514 @@
-"""
-Comprehensive gameplay analysis of trained battle royale agents.
+"""Comprehensive gameplay analysis of a battle royale PPO checkpoint.
 
-Runs tens of thousands of parallel games and tracks deep behavioral stats:
-- Death causes (zone, bullets, timeout)
-- Bullet dodging behavior
-- Combat stats (accuracy, kills, damage)
-- Resource gathering (ammo, medkits)
-- Zone awareness & positioning
-- Movement patterns
-- Smart decision-making metrics:
-  - Fires when enemy in crosshair vs wastes ammo
-  - Heals when low HP
-  - Moves toward zone when outside
-  - Seeks ammo when empty
-  - Engages when armed vs flees when empty
-- Action distributions
-- Checkpoint comparison (early vs late)
+Runs episodes with all agents sharing one policy and collects detailed
+per-step statistics on combat, movement, resource management, attention,
+and engagement patterns.
 
 Usage:
-    uv run python scripts/analyze_gameplay.py
-    uv run python scripts/analyze_gameplay.py --checkpoint battle_royale/runs/myrun/checkpoints/br_ppo_28000.pt
-    uv run python scripts/analyze_gameplay.py --num-envs 30000 --num-episodes 50000
+    CUDA_VISIBLE_DEVICES="" uv run python analyze_gameplay.py
 """
 
-import argparse
-import time
 import math
-import glob
 import os
+import sys
+
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import torch
-import torch.nn.functional as F
+import numpy as np
 
 from battle_royale.sim import BatchedBRSim
 from battle_royale.obs import ObservationBuilder
-from battle_royale.train import (
-    AttentionActorCritic, pack_actor_obs, _actions_to_sim, _sample_actions,
-    _greedy_actions, _apply_action_masks,
-    LSTM_HIDDEN, N_ENTITIES, ENTITY_DIM, MAX_AGENTS, ACTION_REPEAT,
-    SELF_DIM, NUM_DISCRETE_ACTIONS, DISCRETE_ACTION_HEADS,
+from battle_royale.network import (
+    AttentionActorCritic, pack_actor_obs,
+    _actions_to_sim, _apply_action_masks, _sample_actions,
+    MAX_AGENTS, LSTM_HIDDEN, N_ENTITIES, ENTITY_DIM, SELF_DIM,
+    NUM_DISCRETE_ACTIONS, MAX_VISIBLE_BULLETS,
 )
 from battle_royale.config import (
-    AGENT_MAX_HP, ZONE_SHRINK_START, ZONE_SHRINK_END,
-    ZONE_MAX_RADIUS, ZONE_MIN_RADIUS, ARENA_W, ARENA_H,
-    BULLET_RADIUS, AGENT_RADIUS, BULLET_SPEED, ZONE_DAMAGE_PER_FRAME,
-    MAX_EPISODE_FRAMES, AMMO_MAX, FIRE_COOLDOWN, BULLET_DAMAGE,
-    AGENT_SPEED, ENTITY_FOV_RADIUS, MEDKIT_MAX, HEAL_CHANNEL_FRAMES,
+    FIRE_COOLDOWN, AGENT_MAX_HP, AGENT_SPEED, ARENA_W, ARENA_H,
+    NUM_AMMO_DEPOSITS, NUM_HEALTH_PICKUPS,
+    ZONE_MAX_RADIUS, ZONE_MIN_RADIUS, ZONE_SHRINK_START, ZONE_SHRINK_END,
+    MAX_EPISODE_FRAMES,
 )
-
-
-def load_checkpoint(path, device):
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    sd = {k.removeprefix("_orig_mod."): v for k, v in ckpt["network"].items()}
-    return sd, ckpt
-
-
-def run_analysis(checkpoint_path, num_envs=30000, target_episodes=50000):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    A = MAX_AGENTS  # 4
-
-    # Load network
-    network = AttentionActorCritic().to(device)
-    sd, ckpt = load_checkpoint(checkpoint_path, device)
-    network.load_state_dict(sd)
-    network.eval()
-    update_count = ckpt.get("update_count", "?")
-    print(f"Loaded {checkpoint_path} (update {update_count})")
-    print(f"Running {num_envs:,} parallel envs, targeting {target_episodes:,} completed episodes\n")
-
-    B = num_envs
-    sim = BatchedBRSim(num_envs=B, max_agents=A, device=str(device))
-    obs_builder = ObservationBuilder(sim)
-
-    # LSTM states (B*A,)
-    lstm_hx = torch.zeros(B * A, LSTM_HIDDEN, device=device)
-    lstm_cx = torch.zeros(B * A, LSTM_HIDDEN, device=device)
-
-    # ===================================================================
-    # Accumulators
-    # ===================================================================
-    total_episodes = 0
-    S = {}  # stats dict for cleanliness
-
-    def inc(key, val=1):
-        S[key] = S.get(key, 0) + (val if isinstance(val, (int, float)) else val.item())
-
-    def inc_t(key, tensor):
-        """Increment by sum of a tensor."""
-        S[key] = S.get(key, 0) + tensor.sum().item()
-
-    # Pre-step tracking tensors
-    prev_cooldown = sim.agent_cooldown.clone()
-    health_before = sim.agent_health.clone()
-
-    # Action distribution accumulators
-    action_counts = [torch.zeros(n, device=device, dtype=torch.long) for n in DISCRETE_ACTION_HEADS]
-
-    # Continuous rotation stats
-    rotation_sum = torch.zeros(1, device=device)
-    rotation_sq_sum = torch.zeros(1, device=device)
-    rotation_count = torch.zeros(1, device=device, dtype=torch.long)
-
-    # For tracking per-agent episode ammo at death
-    peak_ammo_per_life = torch.zeros(B, A, device=device)
-
-    start_time = time.time()
-    total_steps = 0
-
-    print("Running simulation...")
-
-    while total_episodes < target_episodes:
-        # ---- Observations ----
-        actor_obs = obs_builder.actor_obs()
-        self_feat, entities, entity_mask = pack_actor_obs(actor_obs)
-
-        sf = self_feat.reshape(B * A, SELF_DIM)
-        ent = entities.reshape(B * A, N_ENTITIES, ENTITY_DIM)
-        emask = entity_mask.reshape(B * A, N_ENTITIES)
-
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float16, enabled=device.type == 'cuda'):
-            logits, alpha, beta_param, (lstm_hx, lstm_cx) = network.forward_actor(
-                sf, ent, emask, hx=lstm_hx, cx=lstm_cx)
-            logits = _apply_action_masks(logits, sf)
-            disc_actions, cont_actions = _sample_actions(logits, alpha, beta_param)
-
-        # ---- Action distribution tracking ----
-        for i, head_logits in enumerate(logits):
-            chosen = disc_actions[:, i]  # (B*A,)
-            action_counts[i].scatter_add_(0, chosen, torch.ones_like(chosen, dtype=torch.long))
-
-        # Continuous rotation stats
-        rotation_delta = cont_actions.float() * 2 * math.pi - math.pi  # [0,1] -> [-pi, pi]
-        rotation_sum += rotation_delta.sum()
-        rotation_sq_sum += (rotation_delta ** 2).sum()
-        rotation_count += rotation_delta.numel()
-
-        disc_ba = disc_actions.reshape(B, A, NUM_DISCRETE_ACTIONS)
-        cont_ba = cont_actions.reshape(B, A)
-        mx, my, aim, fire, heal = _actions_to_sim(disc_ba, cont_ba, sim.agent_dir)
-
-        is_alive = sim.agent_alive  # (B, A)
-
-        # ========== PRE-STEP SITUATIONAL ANALYSIS ==========
-
-        # --- Zone geometry ---
-        zone_progress = ((sim.frame.float() - ZONE_SHRINK_START) /
-                         (ZONE_SHRINK_END - ZONE_SHRINK_START)).clamp(0, 1)
-        zone_radius = ZONE_MAX_RADIUS + (ZONE_MIN_RADIUS - ZONE_MAX_RADIUS) * zone_progress
-        dist_to_center = ((sim.agent_x - ARENA_W / 2)**2 +
-                          (sim.agent_y - ARENA_H / 2)**2).sqrt()
-        outside_zone = (dist_to_center > zone_radius.unsqueeze(1)) & is_alive
-
-        # --- Other agent visibility ---
-        # Build pairwise distances (B, A, A)
-        dx_aa = sim.agent_x.unsqueeze(2) - sim.agent_x.unsqueeze(1)  # (B, A, A)
-        dy_aa = sim.agent_y.unsqueeze(2) - sim.agent_y.unsqueeze(1)
-        dist_aa = (dx_aa**2 + dy_aa**2).sqrt()
-        eye_mask = torch.eye(A, device=device, dtype=torch.bool).unsqueeze(0)  # (1, A, A)
-        other_alive = sim.agent_alive.unsqueeze(1).expand(B, A, A)  # (B, A, A)
-        enemy_visible = (dist_aa < ENTITY_FOV_RADIUS) & ~eye_mask & other_alive & is_alive.unsqueeze(2)
-
-        any_enemy_visible = enemy_visible.any(dim=2)  # (B, A)
-        nearest_enemy_dist = dist_aa.masked_fill(eye_mask | ~other_alive | ~is_alive.unsqueeze(2), 1e6).min(dim=2).values  # (B, A)
-        enemy_close = nearest_enemy_dist < 300  # within ~300px
-        enemy_very_close = nearest_enemy_dist < 150
-
-        # --- Aim quality: angle between aim direction and nearest enemy ---
-        nearest_enemy_idx = dist_aa.masked_fill(eye_mask | ~other_alive, 1e6).argmin(dim=2)  # (B, A)
-        ne_x = sim.agent_x.gather(1, nearest_enemy_idx)  # (B, A)
-        ne_y = sim.agent_y.gather(1, nearest_enemy_idx)
-        angle_to_nearest = torch.atan2(ne_y - sim.agent_y, ne_x - sim.agent_x)
-        aim_error = torch.atan2(
-            torch.sin(sim.agent_dir - angle_to_nearest),
-            torch.cos(sim.agent_dir - angle_to_nearest)
-        ).abs()  # (B, A) in [0, pi]
-        aiming_at_enemy = aim_error < 0.15  # ~8.6 degrees
-        aiming_roughly = aim_error < 0.5  # ~28 degrees
-
-        # --- Bullet proximity ---
-        bullet_nearby_sq = 150.0 ** 2
-        bdx = sim.bullet_x.unsqueeze(1) - sim.agent_x.unsqueeze(-1)
-        bdy = sim.bullet_y.unsqueeze(1) - sim.agent_y.unsqueeze(-1)
-        bdist_sq = bdx**2 + bdy**2
-        agent_idx_t = torch.arange(A, device=device).view(1, A, 1)
-        not_own_bullet = sim.bullet_owner.unsqueeze(1) != agent_idx_t
-        enemy_bullet_nearby = (
-            (bdist_sq < bullet_nearby_sq) &
-            sim.bullet_active.unsqueeze(1) &
-            not_own_bullet
-        ).any(dim=-1)  # (B, A)
-
-        # Check if bullet is heading toward agent (dot product of bullet vel and relative pos)
-        # Bullet vel: (B, 1, M), agent pos relative to bullet: -(bdx, bdy)
-        # dot = bvx * (-bdx) + bvy * (-bdy) > 0 means approaching
-        bullet_approaching = (
-            (sim.bullet_vx.unsqueeze(1) * (-bdx) + sim.bullet_vy.unsqueeze(1) * (-bdy) > 0) &
-            (bdist_sq < bullet_nearby_sq) &
-            sim.bullet_active.unsqueeze(1) &
-            not_own_bullet
-        ).any(dim=-1)  # (B, A)
-
-        # --- Movement ---
-        speed = (sim.agent_vx**2 + sim.agent_vy**2).sqrt()
-        is_moving = speed > 0.5
-        is_healing = sim.agent_heal_progress > 0
-
-        # --- Ammo/HP status ---
-        has_ammo = sim.agent_ammo > 0
-        low_ammo = sim.agent_ammo <= 5
-        no_ammo = sim.agent_ammo == 0
-        low_hp = sim.agent_health < 50
-        very_low_hp = sim.agent_health < 25
-        has_medkits = sim.agent_medkits > 0
-        full_hp = sim.agent_health >= AGENT_MAX_HP - 1
-
-        # --- Movement toward zone center ---
-        vel_toward_center_x = (ARENA_W / 2 - sim.agent_x).sign()
-        vel_toward_center_y = (ARENA_H / 2 - sim.agent_y).sign()
-        moving_toward_center = (
-            (sim.agent_vx * vel_toward_center_x > 0.5) |
-            (sim.agent_vy * vel_toward_center_y > 0.5)
-        )
-
-        # ========== FRAME-LEVEL STAT TRACKING ==========
-        alive_mask = is_alive  # shorthand
-
-        # Movement
-        inc_t("frames_alive", alive_mask)
-        inc_t("frames_moving", is_moving & alive_mask)
-        inc_t("frames_stationary", ~is_moving & alive_mask)
-        inc_t("frames_healing", is_healing & alive_mask)
-
-        # Zone
-        inc_t("frames_outside_zone", outside_zone)
-        inc_t("frames_outside_zone_moving_toward", outside_zone & moving_toward_center)
-        inc_t("frames_outside_zone_not_moving_toward", outside_zone & ~moving_toward_center)
-        # Zone awareness: when zone is actively shrinking, are they inside?
-        zone_shrinking = (sim.frame >= ZONE_SHRINK_START).unsqueeze(1) & alive_mask
-        inc_t("frames_zone_shrinking", zone_shrinking)
-        inc_t("frames_in_zone_while_shrinking", zone_shrinking & ~outside_zone)
-
-        # Bullet dodging
-        bullets_and_alive = enemy_bullet_nearby & alive_mask
-        approaching_and_alive = bullet_approaching & alive_mask
-        inc_t("dodge_frames_bullet_nearby", bullets_and_alive)
-        inc_t("dodge_frames_nearby_moving", bullets_and_alive & is_moving)
-        inc_t("dodge_frames_nearby_stationary", bullets_and_alive & ~is_moving)
-        inc_t("dodge_frames_approaching", approaching_and_alive)
-        inc_t("dodge_frames_approaching_moving", approaching_and_alive & is_moving)
-        inc_t("dodge_frames_approaching_stationary", approaching_and_alive & ~is_moving)
-
-        # Aim quality
-        inc_t("aim_frames_enemy_visible", any_enemy_visible & alive_mask)
-        inc_t("aim_frames_on_target", aiming_at_enemy & any_enemy_visible & alive_mask)
-        inc_t("aim_frames_roughly_on", aiming_roughly & any_enemy_visible & alive_mask)
-        inc_t("aim_error_sum", (aim_error * any_enemy_visible.float() * alive_mask.float()))
-        inc_t("aim_error_count", any_enemy_visible & alive_mask)
-
-        # Decision quality: fire when aiming at enemy with ammo
-        wants_fire = disc_ba[:, :, 2] == 1  # fire action
-        inc_t("fire_when_aiming_at_enemy", wants_fire & aiming_at_enemy & has_ammo & any_enemy_visible & alive_mask)
-        inc_t("fire_when_not_aiming", wants_fire & ~aiming_roughly & has_ammo & alive_mask)
-        inc_t("fire_when_no_ammo", wants_fire & no_ammo & alive_mask)
-        inc_t("fire_when_no_enemy_visible", wants_fire & ~any_enemy_visible & alive_mask)
-        inc_t("fire_total_decisions", wants_fire & alive_mask)
-        inc_t("no_fire_when_should", ~wants_fire & aiming_at_enemy & has_ammo & any_enemy_visible & alive_mask & (sim.agent_cooldown == 0))
-
-        # Heal decisions
-        wants_heal = disc_ba[:, :, 3] == 1
-        inc_t("heal_when_low_hp_has_medkit", wants_heal & low_hp & has_medkits & alive_mask)
-        inc_t("heal_when_full_hp", wants_heal & full_hp & alive_mask)
-        inc_t("heal_opportunities_low_hp", low_hp & has_medkits & alive_mask)
-        inc_t("heal_while_enemy_close", wants_heal & enemy_very_close & alive_mask)
-        inc_t("heal_total_decisions", wants_heal & alive_mask)
-
-        # Engagement decisions
-        inc_t("engage_has_ammo_enemy_visible", any_enemy_visible & has_ammo & alive_mask)
-        inc_t("engage_no_ammo_enemy_visible", any_enemy_visible & no_ammo & alive_mask)
-        inc_t("engage_no_ammo_enemy_close_moving_away",
-              enemy_close & no_ammo & alive_mask & is_moving &
-              ~moving_toward_center)  # rough proxy for fleeing
-
-        # Ammo tracking
-        peak_ammo_per_life = torch.maximum(peak_ammo_per_life, sim.agent_ammo)
-
-        # ========== STEP THE SIM ==========
-        alive_before_step = sim.agent_alive.clone()
-        health_before_step = sim.agent_health.clone()
-        ammo_before_step = sim.agent_ammo.clone()
-        medkits_before_step = sim.agent_medkits.clone()
-
-        step_rewards = torch.zeros(B, A, device=device)
-        agent_done = torch.zeros(B, A, dtype=torch.bool, device=device)
-
-        for _rep in range(ACTION_REPEAT):
-            cur_alive = sim.agent_alive.clone()
-            move_x = mx * cur_alive
-            move_y = my * cur_alive
-
-            rewards, episode_done = sim.step(move_x, move_y, aim, fire & cur_alive, heal & cur_alive)
-            step_rewards += rewards
-            agent_done |= cur_alive & (~sim.agent_alive | episode_done[:, None])
-
-            # Shots fired (cooldown jump to FIRE_COOLDOWN)
-            just_fired = (sim.agent_cooldown == FIRE_COOLDOWN) & (prev_cooldown < FIRE_COOLDOWN) & cur_alive
-            inc_t("shots_fired", just_fired)
-            prev_cooldown = sim.agent_cooldown.clone()
-
-            # Damage tracking
-            health_after = sim.agent_health.clone()
-            health_drop = (health_before - health_after).clamp(min=0)
-
-            zp = ((sim.frame.float() - ZONE_SHRINK_START) /
-                  (ZONE_SHRINK_END - ZONE_SHRINK_START)).clamp(0, 1)
-            zr = ZONE_MAX_RADIUS + (ZONE_MIN_RADIUS - ZONE_MAX_RADIUS) * zp
-            dtc = ((sim.agent_x - ARENA_W / 2)**2 + (sim.agent_y - ARENA_H / 2)**2).sqrt()
-            outside = (dtc > zr.unsqueeze(1)) & cur_alive
-            zone_dmg = ZONE_DAMAGE_PER_FRAME * outside.float()
-            inc_t("zone_damage_taken", zone_dmg)
-
-            bullet_dmg = (health_drop - zone_dmg).clamp(min=0)
-            inc_t("bullet_hits", bullet_dmg > 0)
-            inc_t("bullet_damage_dealt", bullet_dmg)
-
-            # Deaths
-            just_died = cur_alive & ~sim.agent_alive
-            if just_died.any():
-                died_outside = just_died & outside
-                died_bullet = just_died & (bullet_dmg > 0)
-                inc_t("deaths_total", just_died)
-                inc_t("deaths_to_zone", died_outside & ~died_bullet)
-                inc_t("deaths_to_bullets", died_bullet)
-                # Death with no ammo = never picked up / ran out
-                inc_t("deaths_with_no_ammo", just_died & (sim.agent_ammo <= 0))
-                inc_t("deaths_with_full_ammo", just_died & (sim.agent_ammo >= AMMO_MAX - 1))
-                # Death while healing
-                inc_t("deaths_while_healing", just_died & (sim.agent_heal_progress > 0))
-                # Track HP at death
-                # (health is now <= 0, use health_before for last known HP)
-                # Deaths at various HP ranges
-                hp_at_death = health_before[just_died]
-                inc_t("deaths_hp_was_low", (hp_at_death < 30).sum())
-
-            health_before = health_after
-
-            # Ammo pickups
-            ammo_gained = (sim.agent_ammo - ammo_before_step).clamp(min=0)
-            inc_t("ammo_pickups", ammo_gained > 0)
-            ammo_before_step = sim.agent_ammo.clone()
-
-            # Medkit pickups
-            medkits_gained = (sim.agent_medkits - medkits_before_step).clamp(min=0)
-            inc_t("medkit_pickups", medkits_gained)
-            medkits_before_step = sim.agent_medkits.clone()
-
-            # Heals completed
-            # TODO: this is approximate
-
-            # Episode completion
-            if episode_done.any():
-                done_mask = episode_done
-                n_done = done_mask.sum().item()
-                total_episodes += n_done
-
-                # Placement
-                for place in range(1, A + 1):
-                    inc(f"placement_{place}", (sim.agent_place[done_mask] == place).sum().item())
-
-                # Episode length
-                inc_t("episode_length_sum", sim.frame[done_mask].float())
-
-                # Timeout vs last standing
-                timed_out = sim.frame[done_mask] >= MAX_EPISODE_FRAMES
-                inc("episodes_timeout", timed_out.sum().item())
-                inc("episodes_last_standing", (~timed_out).sum().item())
-
-                # Survivors
-                alive_end = sim.agent_alive[done_mask]
-                inc_t("survivors_total", alive_end)
-
-                # Peak ammo achieved
-                inc_t("peak_ammo_sum", peak_ammo_per_life[done_mask])
-                inc("peak_ammo_count", n_done * A)
-
-                # Reset
-                sim.reset(mask=done_mask)
-                health_before[done_mask] = AGENT_MAX_HP
-                prev_cooldown[done_mask] = 0
-                ammo_before_step[done_mask] = 0
-                medkits_before_step[done_mask] = 0
-                peak_ammo_per_life[done_mask] = 0
-
-                done_expanded = done_mask.unsqueeze(1).expand(B, A).reshape(B * A)
-                lstm_hx = torch.where(done_expanded.unsqueeze(1), torch.zeros_like(lstm_hx), lstm_hx)
-                lstm_cx = torch.where(done_expanded.unsqueeze(1), torch.zeros_like(lstm_cx), lstm_cx)
-
-        total_steps += 1
-
-        if total_steps % 50 == 0:
-            elapsed = time.time() - start_time
-            eps_per_sec = total_episodes / max(elapsed, 1)
-            total_sim_frames = total_steps * ACTION_REPEAT * B * A
-            pct = total_episodes * 100 / target_episodes
-            print(f"  Step {total_steps:>5d} | {total_episodes:>7,d} ep "
-                  f"({pct:.0f}%) | "
-                  f"{total_sim_frames/1e6:>6.0f}M frames | "
-                  f"{eps_per_sec:.0f} ep/s | "
-                  f"{elapsed:.0f}s")
-
-    elapsed = time.time() - start_time
-    total_sim_frames = total_steps * ACTION_REPEAT * B * A
-    g = lambda k: S.get(k, 0)  # getter with default 0
-
-    # Normalize action counts
-    action_total = sum(c.sum().item() for c in action_counts)
-
-    # ===================================================================
-    # PRINT REPORT
-    # ===================================================================
-    print("\n" + "=" * 74)
-    print(f"  BATTLE ROYALE AGENT ANALYSIS — update {update_count}")
-    print("=" * 74)
-    print(f"  Checkpoint:    {checkpoint_path}")
-    print(f"  Episodes:      {total_episodes:,}")
-    print(f"  Sim frames:    {total_sim_frames:,.0f}")
-    print(f"  Wall time:     {elapsed:.1f}s")
-    print(f"  Throughput:    {total_episodes / elapsed:.0f} ep/s, "
-          f"{total_sim_frames / elapsed / 1e6:.1f}M frames/s")
-
-    fa = max(g("frames_alive"), 1)
-    ep_a = max(total_episodes * A, 1)
-
-    print()
-    print("--- PLACEMENT DISTRIBUTION ---")
-    total_p = sum(g(f"placement_{p}") for p in range(1, A + 1))
-    for p in range(1, A + 1):
-        c = g(f"placement_{p}")
-        pct = c / max(total_p, 1) * 100
-        bar = "#" * int(pct / 2)
-        ordinal = f"{p}{'st' if p == 1 else 'nd' if p == 2 else 'rd' if p == 3 else 'th'}"
-        print(f"  {ordinal}: {c:>8,d}  ({pct:5.1f}%)  {bar}")
-    avg_ep_len = g("episode_length_sum") / max(total_episodes, 1)
-    print(f"\n  Avg episode length:  {avg_ep_len:.0f} frames ({avg_ep_len/60:.1f}s)")
-    print(f"  Timeouts:            {g('episodes_timeout'):,}")
-    print(f"  Last-standing wins:  {g('episodes_last_standing'):,}")
-
-    print()
-    print("--- DEATH CAUSES ---")
-    dt = max(g("deaths_total"), 1)
-    print(f"  Total deaths:          {g('deaths_total'):>10,d}")
-    print(f"  Killed by bullets:     {g('deaths_to_bullets'):>10,d}  ({g('deaths_to_bullets')/dt*100:5.1f}%)")
-    print(f"  Killed by zone:        {g('deaths_to_zone'):>10,d}  ({g('deaths_to_zone')/dt*100:5.1f}%)")
-    other = g("deaths_total") - g("deaths_to_bullets") - g("deaths_to_zone")
-    print(f"  Mixed/other:           {other:>10,d}  ({other/dt*100:5.1f}%)")
-    print(f"  Died with 0 ammo:      {g('deaths_with_no_ammo'):>10,d}  ({g('deaths_with_no_ammo')/dt*100:5.1f}%)")
-    print(f"  Died with full ammo:   {g('deaths_with_full_ammo'):>10,d}  ({g('deaths_with_full_ammo')/dt*100:5.1f}%)")
-    print(f"  Died while healing:    {g('deaths_while_healing'):>10,d}  ({g('deaths_while_healing')/dt*100:5.1f}%)")
-
-    print()
-    print("--- COMBAT STATS ---")
-    sf = max(g("shots_fired"), 1)
-    print(f"  Shots fired:           {g('shots_fired'):>10,d}  ({g('shots_fired')/ep_a:.1f}/agent/ep)")
-    print(f"  Bullet hits:           {g('bullet_hits'):>10,d}  ({g('bullet_hits')/ep_a:.1f}/agent/ep)")
-    print(f"  Accuracy:              {g('bullet_hits')/sf*100:>10.1f}%")
-    print(f"  Bullet dmg dealt:      {g('bullet_damage_dealt'):>10,.0f} HP  ({g('bullet_damage_dealt')/ep_a:.1f}/agent/ep)")
-
-    print()
-    print("--- FIRING DECISIONS ---")
-    ft = max(g("fire_total_decisions"), 1)
-    print(f"  Total fire actions:    {g('fire_total_decisions'):>10,d}")
-    print(f"  Fire ON target:        {g('fire_when_aiming_at_enemy'):>10,d}  ({g('fire_when_aiming_at_enemy')/ft*100:5.1f}%)")
-    print(f"  Fire OFF target:       {g('fire_when_not_aiming'):>10,d}  ({g('fire_when_not_aiming')/ft*100:5.1f}%)")
-    print(f"  Fire with no ammo:     {g('fire_when_no_ammo'):>10,d}  ({g('fire_when_no_ammo')/ft*100:5.1f}%)")
-    print(f"  Fire with no enemy:    {g('fire_when_no_enemy_visible'):>10,d}  ({g('fire_when_no_enemy_visible')/ft*100:5.1f}%)")
-    no_fire_should = g("no_fire_when_should")
-    fire_on = g("fire_when_aiming_at_enemy")
-    trigger_opps = max(no_fire_should + fire_on, 1)
-    print(f"  Trigger discipline:    {fire_on/trigger_opps*100:>10.1f}%  "
-          f"(fires {fire_on:,d} / skips {no_fire_should:,d} when on-target & ready)")
-
-    print()
-    print("--- AIM QUALITY ---")
-    ae_count = max(g("aim_error_count"), 1)
-    print(f"  Frames enemy visible:  {g('aim_frames_enemy_visible'):>10,d}")
-    avg_aim_err = g("aim_error_sum") / ae_count
-    print(f"  Mean aim error:        {avg_aim_err:>10.2f} rad  ({math.degrees(avg_aim_err):.1f} deg)")
-    print(f"  On target (<8.6 deg):  {g('aim_frames_on_target')/ae_count*100:>10.1f}%")
-    print(f"  Roughly on (<28 deg):  {g('aim_frames_roughly_on')/ae_count*100:>10.1f}%")
-
-    print()
-    print("--- BULLET DODGING ---")
-    dn = max(g("dodge_frames_bullet_nearby"), 1)
-    da = max(g("dodge_frames_approaching"), 1)
-    overall_move_pct = g("frames_moving") / fa * 100
-    print(f"  Enemy bullet within 150px:")
-    print(f"    Total frames:        {g('dodge_frames_bullet_nearby'):>10,d}")
-    print(f"    Moving:              {g('dodge_frames_nearby_moving')/dn*100:>10.1f}%")
-    print(f"    Stationary:          {g('dodge_frames_nearby_stationary')/dn*100:>10.1f}%")
-    print(f"  Enemy bullet APPROACHING (heading toward agent):")
-    print(f"    Total frames:        {g('dodge_frames_approaching'):>10,d}")
-    print(f"    Moving:              {g('dodge_frames_approaching_moving')/da*100:>10.1f}%")
-    print(f"    Stationary:          {g('dodge_frames_approaching_stationary')/da*100:>10.1f}%")
-    print(f"  Baseline movement:     {overall_move_pct:>10.1f}%")
-    dodge_delta = g("dodge_frames_approaching_moving") / da * 100 - overall_move_pct
-    print(f"  Dodge boost (approach):{dodge_delta:>+10.1f}pp")
-
-    print()
-    print("--- HEALING DECISIONS ---")
-    ht = max(g("heal_total_decisions"), 1)
-    ho = max(g("heal_opportunities_low_hp"), 1)
-    print(f"  Heal actions (total):  {g('heal_total_decisions'):>10,d}")
-    print(f"  Heal when low HP+med:  {g('heal_when_low_hp_has_medkit'):>10,d}  "
-          f"({g('heal_when_low_hp_has_medkit')/ho*100:.1f}% of opportunities)")
-    print(f"  Heal when full HP:     {g('heal_when_full_hp'):>10,d}  ({g('heal_when_full_hp')/ht*100:.1f}% of heal actions)")
-    print(f"  Heal near enemy(<150): {g('heal_while_enemy_close'):>10,d}  ({g('heal_while_enemy_close')/ht*100:.1f}% of heal actions)")
-
-    print()
-    print("--- ZONE AWARENESS ---")
-    oz = max(g("frames_outside_zone"), 1)
-    zs = max(g("frames_zone_shrinking"), 1)
-    print(f"  % time outside zone:   {g('frames_outside_zone')/fa*100:>10.2f}%")
-    print(f"  Moving toward center:  {g('frames_outside_zone_moving_toward')/oz*100:>10.1f}%  (when outside)")
-    print(f"  NOT toward center:     {g('frames_outside_zone_not_moving_toward')/oz*100:>10.1f}%  (when outside)")
-    print(f"  In zone during shrink: {g('frames_in_zone_while_shrinking')/zs*100:>10.1f}%")
-    print(f"  Zone dmg per agent/ep: {g('zone_damage_taken')/ep_a:>10.1f} HP")
-
-    print()
-    print("--- RESOURCES ---")
-    print(f"  Ammo pickups/agent/ep: {g('ammo_pickups')/ep_a:>10.2f}")
-    print(f"  Medkits picked up/a/e: {g('medkit_pickups')/ep_a:>10.2f}")
-    avg_peak = g("peak_ammo_sum") / max(g("peak_ammo_count"), 1)
-    print(f"  Avg peak ammo/life:    {avg_peak:>10.1f}")
-
-    print()
-    print("--- MOVEMENT ---")
-    print(f"  Moving (spd>0.5):      {g('frames_moving')/fa*100:>10.1f}%")
-    print(f"  Stationary:            {g('frames_stationary')/fa*100:>10.1f}%")
-    print(f"  Healing (channeling):  {g('frames_healing')/fa*100:>10.1f}%")
-
-    print()
-    print("--- ACTION DISTRIBUTIONS ---")
-    action_names = [
-        ("Move X", ["left", "none", "right"]),
-        ("Move Y", ["up", "none", "down"]),
-        ("Fire", ["no", "yes"]),
-        ("Heal", ["no", "yes"]),
-    ]
-    for i, (name, labels) in enumerate(action_names):
-        counts = action_counts[i].float()
-        total = counts.sum()
-        pcts = counts / total * 100
-        parts = "  ".join(f"{l}:{p:.1f}%" for l, p in zip(labels, pcts.tolist()))
-        print(f"  {name:>8s}: {parts}")
-
-    # Continuous rotation stats
-    rc = max(rotation_count.item(), 1)
-    rot_mean = rotation_sum.item() / rc
-    rot_std = ((rotation_sq_sum.item() / rc) - rot_mean ** 2) ** 0.5
-    print(f"  {'Rotate':>8s}: mean={math.degrees(rot_mean):.1f}°  std={math.degrees(rot_std):.1f}°  (continuous Beta)")
-
-    print()
-    print("--- INTELLIGENCE SCORECARD ---")
-    # Composite scores
-    trigger_score = g("fire_when_aiming_at_enemy") / max(trigger_opps, 1) * 100
-    aim_score = g("aim_frames_on_target") / ae_count * 100
-    zone_score = g("frames_in_zone_while_shrinking") / zs * 100
-    heal_score = g("heal_when_low_hp_has_medkit") / max(ho, 1) * 100
-    dodge_score = max(0, dodge_delta)
-    waste_score = 100 - g("fire_when_no_ammo") / max(ft, 1) * 100  # lower waste = better
-
-    print(f"  Trigger discipline:  {trigger_score:5.1f}%  (fires when on-target & ready)")
-    print(f"  Aim tracking:        {aim_score:5.1f}%  (time aimed at nearest enemy)")
-    print(f"  Zone positioning:    {zone_score:5.1f}%  (in zone during shrink)")
-    print(f"  Heal decisions:      {heal_score:5.1f}%  (heals when low HP & has medkit)")
-    print(f"  Dodge reflex:        {dodge_score:5.1f}pp  (extra movement when bullets approach)")
-    print(f"  Ammo conservation:   {waste_score:5.1f}%  (doesn't fire with empty mag)")
-
-    print()
-    print("=" * 74)
-    return S
-
-
-def compare_checkpoints(ckpt_paths, num_envs=30000, target_episodes=20000):
-    """Run analysis on multiple checkpoints for comparison."""
-    print("=" * 74)
-    print("  CHECKPOINT COMPARISON")
-    print("=" * 74)
-    for path in ckpt_paths:
-        print(f"\n>>> Analyzing {path}...")
-        run_analysis(path, num_envs=num_envs, target_episodes=target_episodes)
+from battle_royale.train import ACTION_REPEAT, _load_checkpoint
+
+# -----------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------
+NUM_EPISODES = 15
+NUM_ENVS = 1
+NUM_AGENTS = MAX_AGENTS  # 10
+CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "battle_royale", "runs", "apex_rp", "checkpoints")
+DEVICE = "cpu"
+
+# Entity slot layout in packed observations
+K_BULLETS = MAX_VISIBLE_BULLETS  # 10
+D_DEPOSITS = NUM_AMMO_DEPOSITS   # 12
+H_PICKUPS = NUM_HEALTH_PICKUPS   # 15
+A_OTHER = NUM_AGENTS - 1         # 9
+
+
+def find_latest_checkpoint(search_dir):
+    import glob
+    pattern = os.path.join(search_dir, "br_ppo_*.pt")
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    def _num(f):
+        s = os.path.basename(f).replace("br_ppo_", "").replace(".pt", "")
+        try:
+            return int(s)
+        except ValueError:
+            return -1
+    return max(files, key=_num)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze trained BR agents")
-    parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--num-envs", type=int, default=30000)
-    parser.add_argument("--num-episodes", type=int, default=50000)
-    parser.add_argument("--compare", nargs="+", type=str, default=None,
-                        help="Compare multiple checkpoints")
-    args = parser.parse_args()
+    device = torch.device(DEVICE)
 
-    if args.compare:
-        compare_checkpoints(args.compare, num_envs=args.num_envs,
-                            target_episodes=args.num_episodes)
-        return
+    # Load checkpoint
+    ckpt_path = find_latest_checkpoint(CHECKPOINT_DIR)
+    if not ckpt_path:
+        print(f"No checkpoint found in {CHECKPOINT_DIR}")
+        sys.exit(1)
 
-    if args.checkpoint is None:
-        from battle_royale.train import _find_latest_checkpoint
-        args.checkpoint = _find_latest_checkpoint()
-        if not args.checkpoint:
-            print("No checkpoints found!")
-            return
+    network = AttentionActorCritic()
+    sd, ckpt = _load_checkpoint(ckpt_path, device)
+    network.load_state_dict(sd, strict=False)
+    network.eval()
+    update_count = ckpt.get("update_count", "?")
+    print(f"Checkpoint: {ckpt_path}")
+    print(f"Update count: {update_count}")
+    print(f"Running {NUM_EPISODES} episodes, {NUM_AGENTS} agents per episode")
+    print()
 
-    run_analysis(args.checkpoint, num_envs=args.num_envs, target_episodes=args.num_episodes)
+    # Initialize sim
+    sim = BatchedBRSim(num_envs=NUM_ENVS, max_agents=NUM_AGENTS, device=DEVICE)
+    obs_builder = ObservationBuilder(sim)
+
+    # -----------------------------------------------------------------------
+    # Accumulators
+    # -----------------------------------------------------------------------
+
+    # Combat
+    total_bullets_fired = 0
+    total_bullets_hit = 0
+    aim_errors = []           # angle error in degrees when firing
+    engagement_distances = [] # distance to nearest visible enemy when firing
+    kill_by_bullet = 0
+    kill_by_zone = 0
+    kill_by_timeout = 0
+    kills_per_episode = []    # per-agent kills each episode
+
+    # Movement & positioning
+    dist_to_zone_center_samples = []  # (frame, distance)
+    zone_deaths = 0
+    total_deaths = 0
+    speed_utilizations = []  # actual_speed / AGENT_SPEED
+
+    # Resource management
+    ammo_pickups_per_episode = []
+    medkit_pickups_per_episode = []
+    heal_when_useful = 0        # healing with low HP + medkits
+    heal_when_useful_possible = 0
+    heal_with_enemies = 0
+    heal_without_enemies = 0
+    heal_total = 0
+    fire_no_ammo = 0
+
+    # Attention
+    attn_bullets_enemy_vis = []
+    attn_deposits_enemy_vis = []
+    attn_health_enemy_vis = []
+    attn_agents_enemy_vis = []
+    attn_bullets_no_enemy = []
+    attn_deposits_no_enemy = []
+    attn_health_no_enemy = []
+    attn_agents_no_enemy = []
+
+    # Episode
+    episode_lengths = []
+
+    # -----------------------------------------------------------------------
+    # Run episodes
+    # -----------------------------------------------------------------------
+    for ep in range(NUM_EPISODES):
+        sim.reset()
+        lstm_hx = torch.zeros(NUM_AGENTS, LSTM_HIDDEN, device=device)
+        lstm_cx = torch.zeros(NUM_AGENTS, LSTM_HIDDEN, device=device)
+
+        # Per-episode tracking
+        ep_ammo_pickups = torch.zeros(NUM_AGENTS, device=device)
+        ep_medkit_pickups = torch.zeros(NUM_AGENTS, device=device)
+        ep_kills = torch.zeros(NUM_AGENTS, dtype=torch.long, device=device)
+        prev_ammo = sim.agent_ammo[0].clone()
+        prev_medkits = sim.agent_medkits[0].clone()
+        prev_health = sim.agent_health[0].clone()
+        prev_alive = sim.agent_alive[0].clone()
+
+        step = 0
+        while True:
+            with torch.no_grad():
+                actor_obs = obs_builder.actor_obs()
+                self_feat, entities, entity_mask = pack_actor_obs(actor_obs)
+
+                # All agents share the same policy
+                sf = self_feat.reshape(NUM_AGENTS, SELF_DIM)
+                ent = entities.reshape(NUM_AGENTS, N_ENTITIES, ENTITY_DIM)
+                emask = entity_mask.reshape(NUM_AGENTS, N_ENTITIES)
+
+                # Forward with attention
+                logits, alpha, beta_param, (lstm_hx_new, lstm_cx_new), attn_weights = \
+                    network.forward_actor(sf, ent, emask, hx=lstm_hx, cx=lstm_cx,
+                                          return_attention=True)
+                logits = _apply_action_masks(logits, sf)
+                disc, cont = _sample_actions(logits, alpha, beta_param)
+                mx, my, aim, fire, heal = _actions_to_sim(disc, cont, sim.agent_dir[0])
+
+                move_x = mx.unsqueeze(0)
+                move_y = my.unsqueeze(0)
+                aim_angle = aim.unsqueeze(0)
+                fire_bool = fire.unsqueeze(0)
+                heal_bool = heal.unsqueeze(0)
+
+            # ---------------------------------------------------------------
+            # Pre-step analysis (before sim.step)
+            # ---------------------------------------------------------------
+            alive = sim.agent_alive[0].clone()
+
+            # --- Attention analysis (per alive agent) ---
+            for a in range(NUM_AGENTS):
+                if not alive[a]:
+                    continue
+                w = attn_weights[a].detach()     # (N,)
+                m = emask[a].detach()             # (N,)
+
+                # Only analyze if at least one entity is visible
+                if not m.any():
+                    continue
+
+                # Check if any enemy agent is visible
+                agent_start = K_BULLETS + D_DEPOSITS + H_PICKUPS
+                agent_end = agent_start + A_OTHER
+                enemies_visible = m[agent_start:agent_end].any().item()
+
+                # Sum attention by entity type (only over valid slots)
+                bullet_mask = m[:K_BULLETS]
+                deposit_mask = m[K_BULLETS:K_BULLETS + D_DEPOSITS]
+                health_mask = m[K_BULLETS + D_DEPOSITS:K_BULLETS + D_DEPOSITS + H_PICKUPS]
+                agent_mask = m[agent_start:agent_end]
+
+                # Weighted sum per type
+                bw = (w[:K_BULLETS] * bullet_mask.float()).sum().item()
+                dw = (w[K_BULLETS:K_BULLETS + D_DEPOSITS] * deposit_mask.float()).sum().item()
+                hw = (w[K_BULLETS + D_DEPOSITS:K_BULLETS + D_DEPOSITS + H_PICKUPS] * health_mask.float()).sum().item()
+                aw = (w[agent_start:agent_end] * agent_mask.float()).sum().item()
+                total_w = bw + dw + hw + aw
+                if total_w < 1e-8:
+                    continue
+
+                # Normalize to fractions
+                bw /= total_w
+                dw /= total_w
+                hw /= total_w
+                aw /= total_w
+
+                if enemies_visible:
+                    attn_bullets_enemy_vis.append(bw)
+                    attn_deposits_enemy_vis.append(dw)
+                    attn_health_enemy_vis.append(hw)
+                    attn_agents_enemy_vis.append(aw)
+                else:
+                    attn_bullets_no_enemy.append(bw)
+                    attn_deposits_no_enemy.append(dw)
+                    attn_health_no_enemy.append(hw)
+                    attn_agents_no_enemy.append(aw)
+
+            # --- Healing analysis ---
+            for a in range(NUM_AGENTS):
+                if not alive[a]:
+                    continue
+                is_healing = heal[a].item()
+                has_medkits = sim.agent_medkits[0, a].item() > 0
+                hp_fraction = sim.agent_health[0, a].item() / AGENT_MAX_HP
+                low_hp = hp_fraction < 0.9
+
+                # Check if enemies visible
+                agent_start = K_BULLETS + D_DEPOSITS + H_PICKUPS
+                agent_end = agent_start + A_OTHER
+                enemies_vis = emask[a, agent_start:agent_end].any().item()
+
+                # Useful heal: low HP AND has medkits
+                if low_hp and has_medkits:
+                    heal_when_useful_possible += 1
+                    if is_healing:
+                        heal_when_useful += 1
+
+                if is_healing:
+                    heal_total += 1
+                    if enemies_vis:
+                        heal_with_enemies += 1
+                    else:
+                        heal_without_enemies += 1
+
+            # --- Speed utilization ---
+            for a in range(NUM_AGENTS):
+                if not alive[a]:
+                    continue
+                speed = math.sqrt(sim.agent_vx[0, a].item()**2 + sim.agent_vy[0, a].item()**2)
+                speed_utilizations.append(speed / AGENT_SPEED)
+
+            # --- Distance to zone center ---
+            frame_val = sim.frame[0].item()
+            for a in range(NUM_AGENTS):
+                if not alive[a]:
+                    continue
+                dx = sim.agent_x[0, a].item() - ARENA_W / 2
+                dy = sim.agent_y[0, a].item() - ARENA_H / 2
+                dist = math.sqrt(dx**2 + dy**2)
+                dist_to_zone_center_samples.append((frame_val, dist))
+
+            # ---------------------------------------------------------------
+            # Step sim with ACTION_REPEAT
+            # ---------------------------------------------------------------
+            for _rep in range(ACTION_REPEAT):
+                pre_health = sim.agent_health[0].clone()
+                pre_alive = sim.agent_alive[0].clone()
+                pre_cooldown = sim.agent_cooldown[0].clone()
+
+                cur_alive = sim.agent_alive[0].clone()
+                m_x = move_x * cur_alive.unsqueeze(0).float()
+                m_y = move_y * cur_alive.unsqueeze(0).float()
+                f_b = fire_bool & cur_alive.unsqueeze(0)
+                h_b = heal_bool & cur_alive.unsqueeze(0)
+
+                rewards, done = sim.step(m_x, m_y, aim_angle, f_b, h_b)
+
+                # Detect fires: agent_cooldown == FIRE_COOLDOWN means just fired
+                for a in range(NUM_AGENTS):
+                    if not pre_alive[a]:
+                        continue
+                    if sim.agent_cooldown[0, a].item() == FIRE_COOLDOWN:
+                        total_bullets_fired += 1
+
+                        # Check ammo (fire_no_ammo should be ~0 with masks)
+                        if prev_ammo[a].item() <= 0:
+                            fire_no_ammo += 1
+
+                        # Aim error: angle between aim direction and nearest visible enemy
+                        agent_x = sim.agent_x[0, a].item()
+                        agent_y = sim.agent_y[0, a].item()
+                        agent_dir = sim.agent_dir[0, a].item()
+
+                        # Find nearest visible enemy
+                        min_dist = float('inf')
+                        nearest_angle = None
+                        nearest_dist = None
+                        for other in range(NUM_AGENTS):
+                            if other == a or not pre_alive[other]:
+                                continue
+                            ox = sim.agent_x[0, other].item()
+                            oy = sim.agent_y[0, other].item()
+                            edx = ox - agent_x
+                            edy = oy - agent_y
+                            edist = math.sqrt(edx**2 + edy**2)
+                            if edist < min_dist and edist < 550.0:  # ENTITY_FOV_RADIUS
+                                min_dist = edist
+                                nearest_angle = math.atan2(edy, edx)
+                                nearest_dist = edist
+
+                        if nearest_angle is not None:
+                            # Aim error — properly wrap to [-pi, pi]
+                            raw_diff = agent_dir - nearest_angle
+                            angle_diff = abs(math.atan2(math.sin(raw_diff), math.cos(raw_diff)))
+                            aim_errors.append(math.degrees(angle_diff))
+                            engagement_distances.append(nearest_dist)
+
+                # Detect hits: health decreased for any agent
+                for a in range(NUM_AGENTS):
+                    if not pre_alive[a]:
+                        continue
+                    if sim.agent_health[0, a].item() < pre_health[a].item():
+                        # Determine if it was a bullet hit (not zone damage)
+                        hp_drop = pre_health[a].item() - sim.agent_health[0, a].item()
+                        # Bullet damage is 25, zone is 0.5/frame
+                        if hp_drop >= 20:  # bullet damage (25) vs zone (0.5)
+                            total_bullets_hit += 1
+
+                # Detect deaths
+                for a in range(NUM_AGENTS):
+                    if pre_alive[a] and not sim.agent_alive[0, a]:
+                        total_deaths += 1
+
+                        # Zone kill check
+                        agent_x = sim.agent_x[0, a].item()
+                        agent_y = sim.agent_y[0, a].item()
+                        frame_now = sim.frame[0].item()
+                        zp = max(0.0, min(1.0, (frame_now - ZONE_SHRINK_START) / (ZONE_SHRINK_END - ZONE_SHRINK_START)))
+                        zone_r = ZONE_MAX_RADIUS + (ZONE_MIN_RADIUS - ZONE_MAX_RADIUS) * zp
+                        dist_to_c = math.sqrt((agent_x - ARENA_W/2)**2 + (agent_y - ARENA_H/2)**2)
+
+                        if dist_to_c > zone_r:
+                            kill_by_zone += 1
+                            zone_deaths += 1
+                        else:
+                            kill_by_bullet += 1
+
+                # Track ammo/medkit pickups
+                for a in range(NUM_AGENTS):
+                    if not sim.agent_alive[0, a]:
+                        continue
+                    ammo_gain = sim.agent_ammo[0, a].item() - prev_ammo[a].item()
+                    if ammo_gain > 0:
+                        ep_ammo_pickups[a] += 1
+                    medkit_gain = sim.agent_medkits[0, a].item() - prev_medkits[a].item()
+                    if medkit_gain > 0:
+                        ep_medkit_pickups[a] += 1
+
+                prev_ammo = sim.agent_ammo[0].clone()
+                prev_medkits = sim.agent_medkits[0].clone()
+
+                if done[0]:
+                    break
+
+            # Update LSTM state (reset dead agents)
+            agent_died = prev_alive & ~sim.agent_alive[0]
+            lstm_hx_new = torch.where(agent_died.unsqueeze(-1), torch.zeros_like(lstm_hx_new), lstm_hx_new)
+            lstm_cx_new = torch.where(agent_died.unsqueeze(-1), torch.zeros_like(lstm_cx_new), lstm_cx_new)
+            lstm_hx = lstm_hx_new.detach()
+            lstm_cx = lstm_cx_new.detach()
+
+            prev_alive = sim.agent_alive[0].clone()
+            step += 1
+
+            if done[0]:
+                # Check for timeout kills
+                timeout = sim.frame[0].item() >= MAX_EPISODE_FRAMES
+                if timeout:
+                    alive_count = sim.agent_alive[0].sum().item()
+                    kill_by_timeout += int(alive_count)
+
+                ep_len = sim.frame[0].item()
+                episode_lengths.append(ep_len)
+                ep_kills = sim.agent_kills[0].clone()
+                kills_per_episode.append(ep_kills.float().mean().item())
+                ammo_pickups_per_episode.append(ep_ammo_pickups.mean().item())
+                medkit_pickups_per_episode.append(ep_medkit_pickups.mean().item())
+
+                print(f"  Episode {ep+1}/{NUM_EPISODES}: length={ep_len} frames, "
+                      f"kills={ep_kills.sum().item()}, "
+                      f"ammo_pickups={ep_ammo_pickups.sum().item():.0f}, "
+                      f"medkit_pickups={ep_medkit_pickups.sum().item():.0f}")
+                break
+
+    # ===================================================================
+    # Report
+    # ===================================================================
+    print()
+    print("=" * 70)
+    print(f"GAMEPLAY ANALYSIS REPORT - Checkpoint update {update_count}")
+    print(f"({NUM_EPISODES} episodes, {NUM_AGENTS} agents/episode)")
+    print("=" * 70)
+
+    # --- Combat ---
+    print()
+    print("--- COMBAT ---")
+    print(f"  Bullets fired:       {total_bullets_fired}")
+    print(f"  Bullets hit:         {total_bullets_hit}")
+    if total_bullets_fired > 0:
+        print(f"  Shot accuracy:       {100 * total_bullets_hit / total_bullets_fired:.1f}%")
+    else:
+        print(f"  Shot accuracy:       N/A (no shots)")
+    if aim_errors:
+        print(f"  Mean aim error:      {np.mean(aim_errors):.1f} deg (median {np.median(aim_errors):.1f})")
+        print(f"    p25={np.percentile(aim_errors, 25):.1f}  p75={np.percentile(aim_errors, 75):.1f}")
+    print(f"  Kill breakdown:")
+    print(f"    Bullet kills:      {kill_by_bullet} ({100*kill_by_bullet/max(1,total_deaths):.1f}%)")
+    print(f"    Zone kills:        {kill_by_zone} ({100*kill_by_zone/max(1,total_deaths):.1f}%)")
+    print(f"    Timeout (alive):   {kill_by_timeout} ({100*kill_by_timeout/max(1,total_deaths+kill_by_timeout):.1f}%)")
+    print(f"    Total deaths:      {total_deaths}")
+    if kills_per_episode:
+        print(f"  Mean kills/ep/agent: {np.mean(kills_per_episode):.2f}")
+
+    # --- Movement & Positioning ---
+    print()
+    print("--- MOVEMENT & POSITIONING ---")
+    if dist_to_zone_center_samples:
+        dists = [d for _, d in dist_to_zone_center_samples]
+        print(f"  Mean dist to zone center:  {np.mean(dists):.0f} px")
+        # Break down by phase: early (0-600), mid (600-3600), late (3600+)
+        early = [d for f, d in dist_to_zone_center_samples if f < ZONE_SHRINK_START]
+        mid = [d for f, d in dist_to_zone_center_samples if ZONE_SHRINK_START <= f < ZONE_SHRINK_END]
+        late = [d for f, d in dist_to_zone_center_samples if f >= ZONE_SHRINK_END]
+        if early:
+            print(f"    Early (<{ZONE_SHRINK_START}f):       {np.mean(early):.0f} px")
+        if mid:
+            print(f"    Mid ({ZONE_SHRINK_START}-{ZONE_SHRINK_END}f):   {np.mean(mid):.0f} px")
+        if late:
+            print(f"    Late (>{ZONE_SHRINK_END}f):     {np.mean(late):.0f} px")
+    print(f"  Zone death rate:           {100*zone_deaths/max(1,total_deaths):.1f}%")
+    if speed_utilizations:
+        print(f"  Speed utilization:         {np.mean(speed_utilizations):.2f} (mean actual/max)")
+        print(f"    p25={np.percentile(speed_utilizations, 25):.2f}  "
+              f"p50={np.percentile(speed_utilizations, 50):.2f}  "
+              f"p75={np.percentile(speed_utilizations, 75):.2f}")
+
+    # --- Resource Management ---
+    print()
+    print("--- RESOURCE MANAGEMENT ---")
+    if ammo_pickups_per_episode:
+        print(f"  Ammo pickups/ep (per agent):   {np.mean(ammo_pickups_per_episode):.1f}")
+    if medkit_pickups_per_episode:
+        print(f"  Medkit pickups/ep (per agent):  {np.mean(medkit_pickups_per_episode):.1f}")
+    if heal_when_useful_possible > 0:
+        print(f"  Heal rate when useful:         {100*heal_when_useful/heal_when_useful_possible:.1f}% "
+              f"({heal_when_useful}/{heal_when_useful_possible})")
+    if heal_total > 0:
+        print(f"  Heal with enemies visible:     {100*heal_with_enemies/heal_total:.1f}% "
+              f"({heal_with_enemies}/{heal_total})")
+        print(f"  Heal without enemies visible:  {100*heal_without_enemies/heal_total:.1f}% "
+              f"({heal_without_enemies}/{heal_total})")
+    print(f"  Fire with no ammo:             {fire_no_ammo} (should be ~0 with masks)")
+
+    # --- Attention Analysis ---
+    print()
+    print("--- ATTENTION ANALYSIS ---")
+    if attn_agents_enemy_vis:
+        print(f"  With enemies visible ({len(attn_agents_enemy_vis)} samples):")
+        print(f"    Bullets:   {100*np.mean(attn_bullets_enemy_vis):.1f}%")
+        print(f"    Deposits:  {100*np.mean(attn_deposits_enemy_vis):.1f}%")
+        print(f"    Health:    {100*np.mean(attn_health_enemy_vis):.1f}%")
+        print(f"    Agents:    {100*np.mean(attn_agents_enemy_vis):.1f}%")
+    if attn_agents_no_enemy:
+        print(f"  Without enemies visible ({len(attn_agents_no_enemy)} samples):")
+        print(f"    Bullets:   {100*np.mean(attn_bullets_no_enemy):.1f}%")
+        print(f"    Deposits:  {100*np.mean(attn_deposits_no_enemy):.1f}%")
+        print(f"    Health:    {100*np.mean(attn_health_no_enemy):.1f}%")
+        print(f"    Agents:    {100*np.mean(attn_agents_no_enemy):.1f}%")
+
+    # --- Engagement ---
+    print()
+    print("--- ENGAGEMENT ---")
+    if engagement_distances:
+        print(f"  Engagement distance (when firing at visible enemy):")
+        print(f"    Mean:   {np.mean(engagement_distances):.0f} px")
+        print(f"    Median: {np.median(engagement_distances):.0f} px")
+        print(f"    p10={np.percentile(engagement_distances, 10):.0f}  "
+              f"p25={np.percentile(engagement_distances, 25):.0f}  "
+              f"p75={np.percentile(engagement_distances, 75):.0f}  "
+              f"p90={np.percentile(engagement_distances, 90):.0f}")
+    if episode_lengths:
+        print(f"  Episode length (frames):")
+        print(f"    Mean:   {np.mean(episode_lengths):.0f}")
+        print(f"    Median: {np.median(episode_lengths):.0f}")
+        print(f"    Min:    {np.min(episode_lengths)}")
+        print(f"    Max:    {np.max(episode_lengths)}")
+        print(f"    Timed out: {sum(1 for l in episode_lengths if l >= MAX_EPISODE_FRAMES)}/{len(episode_lengths)}")
+
+    print()
+    print("=" * 70)
+    print("Analysis complete.")
 
 
 if __name__ == "__main__":

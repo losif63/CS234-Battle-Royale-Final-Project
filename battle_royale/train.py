@@ -35,15 +35,15 @@ from .network import (  # noqa: F401
 # Hyperparameters
 # ---------------------------------------------------------------------------
 NUM_ENVS = 30000
-STEPS_PER_ROLLOUT = 32
+STEPS_PER_ROLLOUT = 64
 MINI_BATCH_SIZE = 131072
 PPO_EPOCHS = 3
-GAMMA = 0.999
+GAMMA = 1.0
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
 VF_COEFF = 0.5
 ENT_COEFF = 0.003
-HEAL_ENT_COEFF = 0.03  # 10x base entropy for heal head to prevent exploration collapse
+HEAL_ENT_COEFF = 0.03
 LR = 3e-4
 MAX_GRAD_NORM = 0.5
 DEFAULT_NUM_UPDATES = 1000
@@ -65,34 +65,26 @@ class PolicyPool:
     def __init__(self, max_size=POOL_MAX_SIZE):
         self.max_size = max_size
         self.snapshots: list[dict] = []
-        self.elos: list[float] = []
-        self.anchor: dict | None = None  # fixed reference at ELO 1000
+        self.anchor: dict | None = None  # fixed reference (first snapshot)
 
-    def add_snapshot(self, network, elo: float = 1000.0):
+    def add_snapshot(self, network):
         sd = {k.removeprefix("_orig_mod."): v.cpu().clone()
               for k, v in network.state_dict().items()}
         if self.anchor is None:
             self.anchor = sd  # first snapshot becomes permanent anchor
         self.snapshots.append(sd)
-        self.elos.append(elo)
         if len(self.snapshots) > self.max_size:
             self.snapshots.pop(0)
-            self.elos.pop(0)
 
-    def sample(self) -> tuple[dict | None, float, int | None]:
-        """Returns (snapshot, elo, pool_index). pool_index=None for anchor."""
+    def sample(self) -> dict | None:
+        """Returns a snapshot (or None if pool is empty)."""
         if not self.snapshots:
-            return None, 1000.0, None
-        # 20% chance to play against the anchor (fixed ELO 1000)
+            return None
+        # 20% chance to play against the anchor (earliest snapshot)
         if self.anchor is not None and torch.rand(1).item() < 0.2:
-            return self.anchor, 1000.0, None
+            return self.anchor
         idx = torch.randint(0, len(self.snapshots), (1,)).item()
-        return self.snapshots[idx], self.elos[idx], idx
-
-    def elo_stats(self) -> tuple[float, float, float]:
-        if not self.elos:
-            return 1000.0, 1000.0, 1000.0
-        return min(self.elos), sum(self.elos) / len(self.elos), max(self.elos)
+        return self.snapshots[idx]
 
     def __len__(self):
         return len(self.snapshots)
@@ -153,8 +145,7 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
     opp_network.eval()
 
     pool = PolicyPool()
-    learner_elo = 1000.0
-    pool.add_snapshot(network, elo=learner_elo)  # seed with initial weights
+    pool.add_snapshot(network)  # seed with initial weights
 
     start_update = 0
     if resume:
@@ -165,21 +156,16 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
         sd = {k: v for k, v in sd.items() if k in model_sd and model_sd[k].shape == v.shape}
         network._orig_mod.load_state_dict(sd, strict=False)
         if resume_weights_only:
-            pool.add_snapshot(network, elo=learner_elo)
+            pool.add_snapshot(network)
             print(f"Loaded weights from {resume} (weights only, fresh optimizer/pool)")
         else:
             optimizer.load_state_dict(ckpt["optimizer"])
             start_update = ckpt["update_count"]
             if "pool_snapshots" in ckpt:
                 pool.snapshots = ckpt["pool_snapshots"]
-            if "pool_elos" in ckpt:
-                pool.elos = ckpt["pool_elos"]
-            else:
-                pool.elos = [1000.0] * len(pool.snapshots)
             if "pool_anchor" in ckpt:
                 pool.anchor = ckpt["pool_anchor"]
-            learner_elo = ckpt.get("learner_elo", 1000.0)
-            print(f"Resumed from {resume} (update {start_update}, elo {learner_elo:.0f})")
+            print(f"Resumed from {resume} (update {start_update})")
 
     print(f"Envs: {B}  Agents: {A}  Rollout: {T}  "
           f"Trans/update: {B*T:,}  Updates: {num_updates}")
@@ -214,6 +200,8 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
     rollout_ep_count = torch.zeros(1, device=device)
     rollout_win_sum = torch.zeros(1, device=device)
     rollout_win_count = torch.zeros(1, device=device)
+    rollout_rp_sum = torch.zeros(1, device=device)
+    rollout_rp_count = torch.zeros(1, device=device)
 
     use_cuda = device.type == "cuda"
     def _sync_time():
@@ -242,7 +230,7 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
             pg["lr"] = LR * frac
 
         # Sample opponent snapshot for this rollout
-        snapshot, opp_elo, opp_pool_idx = pool.sample()
+        snapshot = pool.sample()
         if snapshot is not None:
             opp_network._orig_mod.load_state_dict(snapshot, strict=False)
 
@@ -250,6 +238,8 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
         rollout_ep_count.zero_()
         rollout_win_sum.zero_()
         rollout_win_count.zero_()
+        rollout_rp_sum.zero_()
+        rollout_rp_count.zero_()
 
         # ----- Collect rollout -----
         for t in range(T):
@@ -305,9 +295,24 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
 
                 rewards, episode_done = sim.step(move_x, move_y, aim, fire_bool, heal_bool)
                 step_rewards += rewards
+
+                # Track learner stats before early termination/reset clears them
+                learner_just_died = cur_alive[:, 0] & ~sim.agent_alive[:, 0]
+                learner_won = episode_done & sim.agent_alive[:, 0]
+                learner_got_rp = learner_just_died | learner_won
+                rollout_rp_sum += (sim.episode_rp[:, 0] * learner_got_rp.float()).sum()
+                rollout_rp_count += learner_got_rp.sum()
+                rollout_win_sum += learner_won.float().sum()
+                rollout_win_count += learner_got_rp.sum()
+
+                # End episode early if learner (agent 0) is dead — no point simulating opponents
+                learner_dead = ~sim.agent_alive[:, 0] & ~sim.episode_done
+                episode_done = episode_done | learner_dead
+                sim.episode_done |= learner_dead
+
                 agent_done |= cur_alive & (~sim.agent_alive | episode_done[:, None])
 
-                # Track episode lengths before reset clears frame counter
+                # Track episode stats before reset clears them
                 rollout_ep_len_sum += (episode_done.float() * sim.frame.float()).sum()
 
                 # Always reset done envs (branchless — no-op when mask is all False)
@@ -316,8 +321,6 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
             # Accumulate stats on GPU (no CPU sync)
             done_count = agent_done[:, 0].sum()
             rollout_ep_count += done_count
-            rollout_win_sum += (agent_done[:, 0] & sim.agent_alive[:, 0]).float().sum()
-            rollout_win_count += done_count
 
             # Update LSTM states
             learner_done = agent_done[:, 0]  # (B,)
@@ -432,28 +435,17 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
 
         t_after_ppo = _sync_time()
 
-        # ELO update (zero-sum: learner gains = opponent loses)
-        # Single sync point for stats
+        # Sync stats
         rollout_games = int(rollout_win_count.item())
         rollout_wins = rollout_win_sum.item()
         if rollout_games > 0:
             win_rate = rollout_wins / rollout_games
-            baseline = 1.0 / A  # 0.5 for 1v1, 0.25 for 4 players
-            # Map win_rate so that baseline -> 0.5 for ELO formula
-            if win_rate <= baseline:
-                score = 0.5 * (win_rate / baseline)
-            else:
-                score = 0.5 + 0.5 * ((win_rate - baseline) / (1.0 - baseline))
-            expected = 1.0 / (1.0 + 10 ** ((opp_elo - learner_elo) / 400))
-            elo_delta = 32 * (score - expected)
-            learner_elo += elo_delta
-            # Zero-sum: opponent loses what learner gains
-            if opp_pool_idx is not None:
-                pool.elos[opp_pool_idx] -= elo_delta
+        rp_count = int(rollout_rp_count.item())
+        avg_rp = rollout_rp_sum.item() / max(1, rp_count)
 
         # Snapshot
         if (update + 1) % POOL_SNAPSHOT_EVERY == 0:
-            pool.add_snapshot(network, elo=learner_elo)
+            pool.add_snapshot(network)
 
         # Accumulate phase times
         t_rollout_acc += t_after_rollout - update_start
@@ -471,14 +463,13 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
             ep_count = rollout_ep_count.item()
             avg_ep_len = rollout_ep_len_sum.item() / max(1, ep_count)
             avg_rew = buf_rewards.mean().item()
-            pool_min, pool_avg, pool_max = pool.elo_stats()
             print(
                 f"Update {update+1:>5d}/{start_update+num_updates} | "
                 f"FPS {fps:>10,.0f} | "
                 f"ep_len {avg_ep_len:>3.0f} | "
                 f"L_win {l_win_rate:.2f} | "
-                f"elo {learner_elo:>6.0f} | "
-                f"pool {len(pool)} [{pool_min:.0f}/{pool_avg:.0f}/{pool_max:.0f}] | "
+                f"avg_rp {avg_rp:>6.1f} | "
+                f"pool {len(pool)} | "
                 f"avg_rew {avg_rew:.3f} | "
                 f"pl {total_ploss/n_mbs:.2f} vl {total_vloss/n_mbs:.2f} "
                 f"ent {total_ent/n_mbs:.1f}")
@@ -497,10 +488,7 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
             writer.add_scalar("episode/length", avg_ep_len, step)
             writer.add_scalar("episode/reward", avg_rew, step)
             writer.add_scalar("episode/win_rate", l_win_rate, step)
-            writer.add_scalar("elo/learner", learner_elo, step)
-            writer.add_scalar("elo/pool_min", pool_min, step)
-            writer.add_scalar("elo/pool_avg", pool_avg, step)
-            writer.add_scalar("elo/pool_max", pool_max, step)
+            writer.add_scalar("episode/rp", avg_rp, step)
             writer.add_scalar("pool/size", len(pool), step)
             writer.add_scalar("loss/policy", total_ploss / n_mbs, step)
             writer.add_scalar("loss/value", total_vloss / n_mbs, step)
@@ -515,9 +503,7 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
                 "optimizer": optimizer.state_dict(),
                 "update_count": update + 1,
                 "pool_snapshots": pool.snapshots,
-                "pool_elos": pool.elos,
                 "pool_anchor": pool.anchor,
-                "learner_elo": learner_elo,
             }, path)
             print(f"  -> saved {path}")
 
@@ -529,9 +515,7 @@ def train(run_name, num_updates=DEFAULT_NUM_UPDATES, resume=None, resume_weights
         "optimizer": optimizer.state_dict(),
         "update_count": start_update + num_updates,
         "pool_snapshots": pool.snapshots,
-        "pool_elos": pool.elos,
         "pool_anchor": pool.anchor,
-        "learner_elo": learner_elo,
     }, final_path)
 
     writer.close()
@@ -562,13 +546,18 @@ def main():
                         help="Debug lidar visualization with WASD control")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Checkpoint path for --watch / --play mode")
+    parser.add_argument("--opponent", type=str, default=None,
+                        help="Opponent checkpoint for --watch mode (agent 0 = latest, rest = opponent)")
     parser.add_argument("--fp", action="store_true",
-                        help="First-person camera (--play mode only): follow player with FOV fog of war")
+                        help="First-person camera: follow agent 0 in --watch or --play mode")
+    parser.add_argument("--attention", action="store_true",
+                        help="Show attention weight visualization in --watch mode (lines from agent 0 to attended entities)")
     args = parser.parse_args()
 
     if args.watch:
         from .watch import watch
-        watch(checkpoint=args.checkpoint, run_name=args.run)
+        watch(checkpoint=args.checkpoint, run_name=args.run, opponent=args.opponent,
+              show_attention=args.attention, first_person=args.fp)
     elif args.play:
         from .watch import play
         play(checkpoint=args.checkpoint, run_name=args.run, first_person=args.fp)

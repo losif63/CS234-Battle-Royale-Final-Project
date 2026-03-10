@@ -12,15 +12,16 @@ from .config import NUM_AMMO_DEPOSITS, NUM_HEALTH_PICKUPS
 # Architecture constants
 # ---------------------------------------------------------------------------
 MAX_AGENTS = 10
-LSTM_HIDDEN = 128
+LSTM_HIDDEN = 256
 
 # Entity packing dimensions
-# own(10) + lidar(12) + global(2) = 24
-SELF_DIM = 10 + 12 + 2
+# own(10) + lidar(24) + global(2) = 36
+SELF_DIM = 10 + 24 + 2
 # Type one-hot: [bullet, ammo_deposit, health_pickup, agent] = 4
-# Bullets: 4 feats padded to 8 -> + 4 one-hot = 12
-# Deposits: 2 feats padded to 8 -> + 4 one-hot = 12
-ENTITY_DIM = 12  # 4 type one-hot + 8 max feature dims
+# Bullets: 4 feats padded to 9 -> + 4 one-hot = 13
+# Deposits: 2 feats padded to 9 -> + 4 one-hot = 13
+# Agents: 9 feats (added heal_progress) -> + 4 one-hot = 13
+ENTITY_DIM = 13  # 4 type one-hot + 9 max feature dims
 MAX_VISIBLE_BULLETS = 10
 N_ENTITIES = MAX_VISIBLE_BULLETS + NUM_AMMO_DEPOSITS + NUM_HEALTH_PICKUPS + (MAX_AGENTS - 1)  # 10 + 12 + 15 + 9 = 46
 
@@ -65,28 +66,28 @@ def pack_actor_obs(obs_dict):
     self_features = torch.cat([own, lidar, global_obs], dim=-1)  # (B, A, 23)
 
     # Type one-hots: [bullet, ammo_deposit, health_pickup, agent]
-    # Bullets: type=[1,0,0,0], features padded from 4 to 8
+    # Bullets: type=[1,0,0,0], features padded from 4 to 9
     bullet_type = torch.zeros(B, A, K, 4, device=device)
     bullet_type[..., 0] = 1.0
-    bullet_pad = torch.zeros(B, A, K, 4, device=device)  # pad 4->8
-    bullet_ent = torch.cat([bullet_type, bullets, bullet_pad], dim=-1)  # (B, A, K, 12)
+    bullet_pad = torch.zeros(B, A, K, 5, device=device)  # pad 4->9
+    bullet_ent = torch.cat([bullet_type, bullets, bullet_pad], dim=-1)  # (B, A, K, 13)
 
-    # Deposits: type=[0,1,0,0], features padded from 2 to 8
+    # Deposits: type=[0,1,0,0], features padded from 2 to 9
     deposit_type = torch.zeros(B, A, D, 4, device=device)
     deposit_type[..., 1] = 1.0
-    deposit_pad = torch.zeros(B, A, D, 6, device=device)  # pad 2->8
-    deposit_ent = torch.cat([deposit_type, deposits, deposit_pad], dim=-1)  # (B, A, D, 12)
+    deposit_pad = torch.zeros(B, A, D, 7, device=device)  # pad 2->9
+    deposit_ent = torch.cat([deposit_type, deposits, deposit_pad], dim=-1)  # (B, A, D, 13)
 
-    # Health pickups: type=[0,0,1,0], features padded from 2 to 8
+    # Health pickups: type=[0,0,1,0], features padded from 2 to 9
     hp_type = torch.zeros(B, A, H, 4, device=device)
     hp_type[..., 2] = 1.0
-    hp_pad = torch.zeros(B, A, H, 6, device=device)  # pad 2->8
-    hp_ent = torch.cat([hp_type, health_pickups, hp_pad], dim=-1)  # (B, A, H, 12)
+    hp_pad = torch.zeros(B, A, H, 7, device=device)  # pad 2->9
+    hp_ent = torch.cat([hp_type, health_pickups, hp_pad], dim=-1)  # (B, A, H, 13)
 
-    # Agents: type=[0,0,0,1], features already 8
+    # Agents: type=[0,0,0,1], features already 9
     agent_type = torch.zeros(B, A, A_other, 4, device=device)
     agent_type[..., 3] = 1.0
-    agent_ent = torch.cat([agent_type, agents], dim=-1)  # (B, A, A-1, 12)
+    agent_ent = torch.cat([agent_type, agents], dim=-1)  # (B, A, A-1, 13)
 
     # Concatenate all entities
     entities = torch.cat([bullet_ent, deposit_ent, hp_ent, agent_ent], dim=2)  # (B, A, N, 11)
@@ -123,32 +124,32 @@ class AttentionActorCritic(nn.Module):
 
         # Post-attention MLP (shared encoder output)
         self.post_attn = nn.Sequential(
-            nn.Linear(hidden * 2, 128), nn.ReLU(),
-            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(hidden * 2, lstm_hidden), nn.ReLU(),
+            nn.Linear(lstm_hidden, lstm_hidden), nn.ReLU(),
         )
 
         # LSTM — actor only
-        self.lstm = nn.LSTMCell(128, lstm_hidden)
+        self.lstm = nn.LSTMCell(lstm_hidden, lstm_hidden)
 
-        # Actor head input = 128 (from skip connection: reactive + lstm)
+        # Actor head input = lstm_hidden (from skip connection: reactive + lstm)
         self.actor_mlp = nn.Sequential(
-            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(lstm_hidden, lstm_hidden), nn.ReLU(),
         )
 
         # Discrete action heads
-        self.move_x_head = nn.Linear(128, 3)
-        self.move_y_head = nn.Linear(128, 3)
-        self.fire_head = nn.Linear(128, 2)
-        self.heal_head = nn.Linear(128, 2)
+        self.move_x_head = nn.Linear(lstm_hidden, 3)
+        self.move_y_head = nn.Linear(lstm_hidden, 3)
+        self.fire_head = nn.Linear(lstm_hidden, 2)
+        self.heal_head = nn.Linear(lstm_hidden, 2)
 
         # Continuous rotation head (Beta distribution parameters)
-        self.rotate_alpha = nn.Linear(128, 1)
-        self.rotate_beta = nn.Linear(128, 1)
+        self.rotate_alpha = nn.Linear(lstm_hidden, 1)
+        self.rotate_beta = nn.Linear(lstm_hidden, 1)
 
         # Critic (attention-based, shares encoder + LSTM hidden state)
         self.critic_mlp = nn.Sequential(
-            nn.Linear(128 + lstm_hidden, 128), nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(lstm_hidden * 2, lstm_hidden), nn.ReLU(),
+            nn.Linear(lstm_hidden, 1),
         )
 
         # Orthogonal init
@@ -163,7 +164,7 @@ class AttentionActorCritic(nn.Module):
             nn.init.orthogonal_(head.weight, gain=0.01)
         nn.init.orthogonal_(self.critic_mlp[-1].weight, gain=1.0)
 
-    def _cross_attention(self, query, keys, values, mask):
+    def _cross_attention(self, query, keys, values, mask, return_weights=False):
         """Manual multi-head cross-attention.
 
         Args:
@@ -171,8 +172,9 @@ class AttentionActorCritic(nn.Module):
             keys:   (*, N, hidden)
             values: (*, N, hidden)
             mask:   (*, N) bool — True = attend to this entity
+            return_weights: if True, also return attention weights
         Returns:
-            (*, hidden)
+            (*, hidden) or ((*, hidden), (*, N)) if return_weights
         """
         B_flat = query.shape[0]
         H = self.n_heads
@@ -196,30 +198,48 @@ class AttentionActorCritic(nn.Module):
 
         out = torch.matmul(attn, v)  # (B, H, 1, D)
         out = out.transpose(1, 2).reshape(B_flat, self.hidden)  # (B, hidden)
+
+        if return_weights:
+            # Average attention across heads: (B, H, 1, N) -> (B, N)
+            attn_weights = attn.squeeze(2).mean(dim=1)  # (B, N)
+            return out, attn_weights
         return out
 
-    def _encode(self, self_feat, entities, entity_mask):
-        """Encode observations through attention. Returns (*, 128)."""
+    def _encode(self, self_feat, entities, entity_mask, return_attention=False):
+        """Encode observations through attention. Returns (*, lstm_hidden).
+
+        If return_attention=True, also returns attention weights (*, N).
+        """
         self_embed = self.self_encoder(self_feat)
         ent_embed = self.entity_encoder(entities)
         query = self_embed.unsqueeze(-2)
+        if return_attention:
+            attn_out, attn_weights = self._cross_attention(
+                query, ent_embed, ent_embed, entity_mask, return_weights=True)
+            combined = torch.cat([self_embed, attn_out], dim=-1)
+            return self.post_attn(combined), attn_weights
         attn_out = self._cross_attention(query, ent_embed, ent_embed, entity_mask)
         combined = torch.cat([self_embed, attn_out], dim=-1)
         return self.post_attn(combined)
 
-    def forward_actor(self, self_feat, entities, entity_mask, hx=None, cx=None):
+    def forward_actor(self, self_feat, entities, entity_mask, hx=None, cx=None,
+                       return_attention=False):
         """
         Args:
             self_feat:   (B, self_dim)
             entities:    (B, N, entity_dim)
             entity_mask: (B, N) bool
             hx, cx:      LSTM state (B, lstm_hidden) or None
+            return_attention: if True, also return attention weights (B, N)
         Returns:
-            (discrete_logits, alpha, beta, (hx, cx))
-            discrete_logits: tuple of 4 tensors (move_x, move_y, fire, heal)
-            alpha, beta: (B,) Beta distribution parameters for continuous rotation
+            (discrete_logits, alpha, beta, (hx, cx)) or
+            (discrete_logits, alpha, beta, (hx, cx), attn_weights) if return_attention
         """
-        reactive = self._encode(self_feat, entities, entity_mask)  # (B, 128)
+        if return_attention:
+            reactive, attn_weights = self._encode(
+                self_feat, entities, entity_mask, return_attention=True)
+        else:
+            reactive = self._encode(self_feat, entities, entity_mask)  # (B, 128)
 
         B = reactive.shape[0]
         if hx is None:
@@ -234,6 +254,8 @@ class AttentionActorCritic(nn.Module):
                            self.fire_head(h), self.heal_head(h))
         alpha = F.softplus(self.rotate_alpha(h).squeeze(-1)) + 1.0  # (B,)
         beta = F.softplus(self.rotate_beta(h).squeeze(-1)) + 1.0    # (B,)
+        if return_attention:
+            return discrete_logits, alpha, beta, (hx, cx), attn_weights
         return discrete_logits, alpha, beta, (hx, cx)
 
     def forward_critic(self, self_feat, entities, entity_mask, hx=None):

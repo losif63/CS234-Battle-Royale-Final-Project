@@ -1,7 +1,10 @@
 """Entry point: input handler + game loop."""
 
 import os
-os.environ.setdefault("SDL_AUDIODRIVER", "pulseaudio")
+import sys
+
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("SDL_AUDIODRIVER", "pulseaudio")
 
 import math
 import torch

@@ -13,7 +13,7 @@ from .config import (
 
 
 class ObservationBuilder:
-    def __init__(self, sim: BatchedBRSim, num_lidar_rays: int = 12, lidar_range: float = ENTITY_FOV_RADIUS,
+    def __init__(self, sim: BatchedBRSim, num_lidar_rays: int = 24, lidar_range: float = ENTITY_FOV_RADIUS,
                  max_visible_bullets: int = 10):
         self.sim = sim
         self.num_lidar_rays = num_lidar_rays
@@ -232,6 +232,7 @@ class ObservationBuilder:
         other_vx = sim.agent_vx[:, self.other_idx]
         other_vy = sim.agent_vy[:, self.other_idx]
         other_health = sim.agent_health[:, self.other_idx]
+        other_heal_progress = sim.agent_heal_progress[:, self.other_idx]
         other_alive = sim.agent_alive[:, self.other_idx]
 
         # Own state (B, A, 1)
@@ -251,8 +252,9 @@ class ObservationBuilder:
         rel_vx = (other_vx - my_vx) / AGENT_SPEED
         rel_vy = (other_vy - my_vy) / AGENT_SPEED
 
-        # Health
+        # Health and heal status
         health = other_health / AGENT_MAX_HP
+        heal_progress = other_heal_progress.float() / HEAL_CHANNEL_FRAMES
 
         # Euclidean distance
         dist_sq = dx ** 2 + dy ** 2
@@ -273,8 +275,8 @@ class ObservationBuilder:
         enemy_aim_rel = enemy_aim_rel / math.pi  # [-1, 1], 0 = aiming at me
 
         features = torch.stack([
-            rel_x, rel_y, rel_vx, rel_vy, health, norm_dist, rel_angle, enemy_aim_rel,
-        ], dim=-1)  # (B, A, A-1, 8)
+            rel_x, rel_y, rel_vx, rel_vy, health, norm_dist, rel_angle, enemy_aim_rel, heal_progress,
+        ], dim=-1)  # (B, A, A-1, 9)
 
         # Mask: alive AND within FOV
         in_fov = dist_sq < fov_sq

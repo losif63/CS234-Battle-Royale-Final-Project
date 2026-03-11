@@ -12,4 +12,5 @@ dependencies = [
     "tensorboardx>=2.6.4",
     "tbparse>=0.0.9",
     "matplotlib>=3.10.8",
+    "scipy>=1.15.3",
 ]

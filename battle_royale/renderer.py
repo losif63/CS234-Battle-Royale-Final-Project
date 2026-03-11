@@ -13,9 +13,12 @@ from .config import (
 
 
 class Renderer:
-    def __init__(self, instant_restart=False, camera_follow=None):
+    def __init__(self, instant_restart=False, camera_follow=None, show_attention=False,
+                 fov_mask=True):
         pygame.init()
         self.camera_follow = camera_follow
+        self.show_attention = show_attention
+        self.fov_mask = fov_mask
 
         if camera_follow is not None:
             self.vp_size = int(ENTITY_FOV_RADIUS * 2)
@@ -23,7 +26,8 @@ class Renderer:
                 (self.vp_size, self.vp_size), pygame.RESIZABLE)
             pygame.display.set_caption("Battle Royale (First Person)")
             self.viewport = pygame.Surface((self.vp_size, self.vp_size))
-            self._build_fov_mask()
+            if fov_mask:
+                self._build_fov_mask()
             self._vp_wx = 0.0
             self._vp_wy = 0.0
         else:
@@ -40,6 +44,9 @@ class Renderer:
         self.instant_restart = instant_restart
         self.win_pause_counter = 0
         self.trail_surf = pygame.Surface((ARENA_W, ARENA_H), pygame.SRCALPHA)
+        self.attn_surf = pygame.Surface((ARENA_W, ARENA_H), pygame.SRCALPHA)
+        # Attention data set by watch loop each frame (None = no attention to draw)
+        self.attention_lines = None
 
     def _build_fov_mask(self):
         """Pre-build circular FOV mask (opaque black outside, transparent inside)."""
@@ -84,9 +91,54 @@ class Renderer:
             vp.blit(self.game_surf, (dst_x, dst_y),
                     (src_l, src_t, src_r - src_l, src_b - src_t))
 
-        # Apply circular FOV mask
-        vp.blit(self.fov_mask, (0, 0))
+        # Apply circular FOV mask (only in play mode)
+        if self.fov_mask:
+            vp.blit(self.fov_mask, (0, 0))
         return vp
+
+    def _draw_win_probs(self, target, state, tw):
+        """Draw vertical bar chart of win probabilities in the top-right corner."""
+        probs = state["win_probs"]  # list/array of length num_agents
+        alive = state["agent_alive"]
+        n = state["num_agents"]
+
+        bar_w = 28
+        gap = 6
+        max_bar_h = 160
+        total_w = n * bar_w + (n - 1) * gap
+        x0 = tw - total_w - 16
+        y_base = 16 + max_bar_h  # bottom of bars
+
+        # Semi-transparent background panel
+        pad = 8
+        panel_w = total_w + pad * 2
+        panel_h = max_bar_h + 30 + pad * 2
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel.fill((10, 10, 20, 140))
+        target.blit(panel, (x0 - pad, 16 - pad))
+
+        for i in range(n):
+            x = x0 + i * (bar_w + gap)
+            p = float(probs[i])
+            h = int(max_bar_h * p)
+            base_color = AGENT_COLORS[i % len(AGENT_COLORS)] if alive[i] else (60, 60, 60)
+
+            # Semi-transparent bar
+            if h > 0:
+                bar_surf = pygame.Surface((bar_w, h), pygame.SRCALPHA)
+                bar_surf.fill((*base_color[:3], 200))
+                target.blit(bar_surf, (x, y_base - h))
+
+            # Agent ID below bar
+            label = self.small_font.render(str(i), True, (200, 200, 200))
+            lw, lh = label.get_size()
+            target.blit(label, (x + bar_w // 2 - lw // 2, y_base + 4))
+
+            # Percentage above bar
+            if alive[i] and p >= 0.05:
+                pct = self.small_font.render(f"{p:.0%}", True, (255, 255, 255))
+                pw, ph = pct.get_size()
+                target.blit(pct, (x + bar_w // 2 - pw // 2, y_base - h - ph - 2))
 
     def window_to_game(self, wx, wy):
         """Convert window coordinates to game coordinates."""
@@ -159,8 +211,8 @@ class Renderer:
 
             color = AGENT_COLORS[i % len(AGENT_COLORS)]
 
-            # FOV circle (hidden in FP mode — gives away positions through fog)
-            if self.camera_follow is None:
+            # FOV circle (hidden in FP mode and when attention overlay is active)
+            if self.camera_follow is None and not self.show_attention:
                 fov_color = (*color[:3], 30) if len(color) >= 3 else (100, 100, 100, 30)
                 fov_surf = pygame.Surface((int(ENTITY_FOV_RADIUS * 2), int(ENTITY_FOV_RADIUS * 2)), pygame.SRCALPHA)
                 pygame.draw.circle(fov_surf, fov_color,
@@ -248,6 +300,23 @@ class Renderer:
 
         surf.blit(self.trail_surf, (0, 0))
 
+        # --- Attention weight overlay ---
+        if self.show_attention and self.attention_lines is not None:
+            self.attn_surf.fill((0, 0, 0, 0))
+            for line in self.attention_lines:
+                ax, ay = line["from"]
+                ex, ey = line["to"]
+                r, g, b = line["color"]
+                alpha = line["alpha"]
+                if alpha < 3:
+                    continue  # skip near-invisible lines
+                pygame.draw.line(self.attn_surf, (r, g, b, alpha),
+                                 (int(ax), int(ay)), (int(ex), int(ey)), 2)
+                # Small circle at entity end
+                pygame.draw.circle(self.attn_surf, (r, g, b, min(255, alpha + 40)),
+                                   (int(ex), int(ey)), 4)
+            surf.blit(self.attn_surf, (0, 0))
+
         # --- Viewport extraction (first-person) or full arena ---
         if self.camera_follow is not None:
             target = self._extract_viewport(state)
@@ -263,6 +332,10 @@ class Renderer:
             True, COLOR_HUD_TEXT,
         )
         target.blit(hud_text, (tw - 320, 25))
+
+        # Win probability bar chart (from critic values)
+        if "win_probs" in state:
+            self._draw_win_probs(target, state, tw)
 
         # Win overlay
         pause_done = False

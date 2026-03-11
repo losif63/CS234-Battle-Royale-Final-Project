@@ -55,6 +55,19 @@ class BatchedBRSim:
         self.death_rank_counter = torch.full((self.B,), self.A, dtype=torch.long, device=self.device)
         self.episode_done = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self.episode_rewards = torch.zeros(self.B, self.A, device=self.device)
+        self.episode_rp = torch.zeros(self.B, self.A, device=self.device)  # raw RP for logging
+        self.agent_kills = torch.zeros(self.B, self.A, dtype=torch.long, device=self.device)
+        self.agent_last_hit_by = torch.full((self.B, self.A), -1, dtype=torch.long, device=self.device)
+
+        # Apex-shaped placement curve normalized to [0, 1] so reward scale
+        # matches the value function's expected range (critical for warm-starting).
+        # Shape from Apex S27: exponential decay, top placements worth much more.
+        # Normalized by dividing by max (place 1 value ≈ 125).
+        places = torch.arange(1, self.A + 1, dtype=torch.float32, device=self.device)
+        x = (places - 1) / max(self.A - 1, 1)
+        raw_placement = (126.77 * torch.exp(-5.16 * x) - 1.78).clamp(min=0)
+        self._placement_rp = raw_placement / raw_placement[0].clamp(min=1.0)  # [0, 1]
+        self._kill_bonus = 0.15  # flat per-kill bonus (same scale as damage shaping)
 
         # Bullet state arrays (B, M)
         self.M = MAX_BULLETS
@@ -161,6 +174,9 @@ class BatchedBRSim:
         self.death_rank_counter[mask] = self.A
         self.episode_done[mask] = False
         self.episode_rewards[mask] = 0.0
+        self.episode_rp[mask] = 0.0
+        self.agent_kills[mask] = 0
+        self.agent_last_hit_by[mask] = -1
 
         self._resolve_wall_collisions(mask)
 
@@ -247,11 +263,26 @@ class BatchedBRSim:
         # --- Episode logic ---
         rewards = torch.zeros(self.B, self.A, device=self.device)
 
-        # Reward for dealing damage (normalized by max HP)
+        # Dense damage shaping: guides agent toward aiming/shooting
+        # Dense damage shaping: 0.125 per hit (12.5% of max placement reward)
         rewards += damage_dealt / AGENT_MAX_HP * 0.5
 
         # Detect newly dead agents (only in active episodes) — fully branchless
         just_died = was_alive & ~self.agent_alive & active_env[:, None]
+
+        # Despawn bullets owned by dead agents (prevents posthumous kills)
+        for a in range(self.A):
+            dead_a = just_died[:, a].unsqueeze(1).expand_as(self.bullet_active)  # (B, M)
+            self.bullet_active &= ~(dead_a & (self.bullet_owner == a))
+
+        # Credit kills to attackers
+        for a in range(self.A):
+            died_a = just_died[:, a]  # (B,)
+            killer = self.agent_last_hit_by[:, a].clamp(0)  # (B,)
+            has_killer = died_a & (self.agent_last_hit_by[:, a] >= 0)
+            # Increment killer's kill count (scatter_add with mask)
+            kill_credit = has_killer.long()  # (B,)
+            self.agent_kills.scatter_add_(1, killer.unsqueeze(1), kill_credit.unsqueeze(1))
 
         # Assign placement to newly dead agents
         self.agent_place = torch.where(
@@ -259,8 +290,18 @@ class BatchedBRSim:
             self.death_rank_counter[:, None].expand_as(self.agent_place),
             self.agent_place,
         )
-        place_reward = 1.0 - (self.agent_place - 1).float() / max(self.A - 1, 1)
-        rewards = torch.where(just_died, place_reward, rewards)
+
+        # Terminal reward: Apex-shaped placement [0,1] with kill scaling + flat bonus
+        # Multiplicative: kills amplify placement (Apex-style)
+        # Flat bonus: kills always valuable even at low placements
+        place_idx = (self.agent_place - 1).clamp(0, self.A - 1)  # (B, A)
+        placement_rp = self._placement_rp[place_idx]  # (B, A) in [0, 1]
+        kill_multiplier = 1.0 + 0.2 * self.agent_kills.float()
+        kill_bonus = self._kill_bonus * self.agent_kills.float()
+        total_rp = placement_rp * kill_multiplier + kill_bonus
+        rewards = torch.where(just_died, total_rp, rewards)
+        # Store raw RP for logging
+        self.episode_rp = torch.where(just_died, total_rp, self.episode_rp)
 
         deaths_per_env = just_died.sum(dim=1)
         self.death_rank_counter -= deaths_per_env
@@ -301,18 +342,32 @@ class BatchedBRSim:
             torch.ones_like(self.agent_place),
             self.agent_place,
         )
-        rewards = torch.where(survivor_mask, torch.ones_like(rewards), rewards)
+        # Winner reward: placement[0]=1.0 with kill scaling + flat bonus
+        winner_kill_mult = 1.0 + 0.2 * self.agent_kills.float()
+        winner_kill_bonus = self._kill_bonus * self.agent_kills.float()
+        winner_total_rp = self._placement_rp[0] * winner_kill_mult + winner_kill_bonus
+        rewards = torch.where(survivor_mask, winner_total_rp, rewards)
+        self.episode_rp = torch.where(survivor_mask, winner_total_rp, self.episode_rp)
 
         self.episode_done |= newly_done
 
-        # Timeout
+        # Timeout — survivors share placement equal to number alive (no free 1st place)
         timed_out = (self.frame >= MAX_EPISODE_FRAMES) & ~self.episode_done
         timeout_survivors = self.agent_alive & timed_out[:, None]
+        num_alive_timeout = (self.agent_alive & timed_out[:, None]).sum(dim=1, keepdim=True)  # (B, 1)
         self.agent_place = torch.where(
             timeout_survivors,
-            torch.ones_like(self.agent_place),
+            num_alive_timeout.expand_as(self.agent_place),
             self.agent_place,
         )
+        # Give timeout survivors their placement reward (not winner reward)
+        timeout_place_idx = (num_alive_timeout - 1).clamp(0, self.A - 1).expand_as(self.agent_place)
+        timeout_rp = self._placement_rp[timeout_place_idx]
+        timeout_kill_mult = 1.0 + 0.2 * self.agent_kills.float()
+        timeout_kill_bonus = self._kill_bonus * self.agent_kills.float()
+        timeout_total_rp = timeout_rp * timeout_kill_mult + timeout_kill_bonus
+        rewards = torch.where(timeout_survivors, timeout_total_rp, rewards)
+        self.episode_rp = torch.where(timeout_survivors, timeout_total_rp, self.episode_rp)
         self.episode_done |= timed_out
 
         self.episode_rewards += rewards
@@ -443,6 +498,21 @@ class BatchedBRSim:
         r = torch.sqrt(torch.rand(self.B, self.D, device=self.device)) * zr.unsqueeze(1)
         new_x = (ARENA_W / 2 + torch.cos(angle) * r).clamp(AMMO_PICKUP_RADIUS, ARENA_W - AMMO_PICKUP_RADIUS)
         new_y = (ARENA_H / 2 + torch.sin(angle) * r).clamp(AMMO_PICKUP_RADIUS, ARENA_H - AMMO_PICKUP_RADIUS)
+
+        # Reject positions inside walls — retry up to 5 times
+        for _ in range(5):
+            all_env_mask = torch.ones(self.B, dtype=torch.bool, device=self.device)
+            bad = ready & self._point_in_any_wall(new_x, new_y, all_env_mask)
+            if not bad.any():
+                break
+            angle2 = torch.rand(self.B, self.D, device=self.device) * 2 * 3.14159
+            r2 = torch.sqrt(torch.rand(self.B, self.D, device=self.device)) * zr.unsqueeze(1)
+            rx = (ARENA_W / 2 + torch.cos(angle2) * r2).clamp(AMMO_PICKUP_RADIUS, ARENA_W - AMMO_PICKUP_RADIUS)
+            ry = (ARENA_H / 2 + torch.sin(angle2) * r2).clamp(AMMO_PICKUP_RADIUS, ARENA_H - AMMO_PICKUP_RADIUS)
+            new_x = torch.where(bad, rx, new_x)
+            new_y = torch.where(bad, ry, new_y)
+            # If still bad after retries, skip respawn (stays dead one more frame)
+        ready = ready & ~self._point_in_any_wall(new_x, new_y, torch.ones(self.B, dtype=torch.bool, device=self.device))
 
         self.deposit_x = torch.where(ready, new_x, self.deposit_x)
         self.deposit_y = torch.where(ready, new_y, self.deposit_y)
@@ -598,6 +668,18 @@ class BatchedBRSim:
         damage_dealt = torch.zeros(self.B, self.A, device=self.device)
         owners = self.bullet_owner.clamp(0)
         damage_dealt.scatter_add_(1, owners, bullet_hit_any.float() * BULLET_DAMAGE)
+
+        # Track last attacker per victim for kill credit
+        # For each bullet that hit, update victim's last_hit_by to bullet owner
+        # hit: (B, M, A) — for each victim a, find any bullet that hit them
+        for a in range(self.A):
+            hit_a = hit[:, :, a] & self.bullet_active  # (B, M) — bullets hitting agent a (pre-deactivation check redundant but safe)
+            any_hit = hit_a.any(dim=1)  # (B,)
+            # Get owner of first hitting bullet
+            first_hit_idx = hit_a.to(torch.int).argmax(dim=1)  # (B,)
+            brange = torch.arange(self.B, device=self.device)
+            attacker = self.bullet_owner[brange, first_hit_idx]
+            self.agent_last_hit_by[:, a] = torch.where(any_hit, attacker, self.agent_last_hit_by[:, a])
 
         # Deactivate bullets that hit any agent
         self.bullet_active &= ~bullet_hit_any

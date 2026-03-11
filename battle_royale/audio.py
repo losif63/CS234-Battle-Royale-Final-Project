@@ -3,9 +3,12 @@
 import math
 import os
 
-# Force SDL to route audio through PulseAudio (PipeWire compat layer)
-# so it reaches the correct output device.
-os.environ.setdefault("SDL_AUDIODRIVER", "pulseaudio")
+import sys
+
+# On Linux, force SDL to route audio through PulseAudio (PipeWire compat layer).
+# On macOS, SDL uses CoreAudio by default — setting pulseaudio would break it.
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("SDL_AUDIODRIVER", "pulseaudio")
 
 import pygame
 

@@ -2,7 +2,7 @@
 # Created: November 13th
 import pygame
 from argparse import ArgumentParser
-from src.env import GameEnv
+from src.env import GameEnv, GameEnvV2
 
 # Action indices: 0=STAY, 1=UP, 2=DOWN, 3=LEFT, 4=RIGHT, 5=SHOOT_UP, 6=SHOOT_DOWN, 7=SHOOT_LEFT, 8=SHOOT_RIGHT
 
@@ -24,8 +24,9 @@ ACTION_MAP_P2 = {**MOVE_MAP_P2, **SHOOT_MAP_P2}
 
 def main():
     pygame.init()
-
-    env = GameEnv()
+    env = GameEnvV2()
+    # env = GameEnv()
+    
     env.reset()
 
     # Shoot actions (5-8) are one-shot: only on KEYDOWN, not while held

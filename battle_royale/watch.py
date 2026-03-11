@@ -117,7 +117,9 @@ def watch(checkpoint: str | None = None, run_name: str | None = None):
 def play(checkpoint: str | None = None, run_name: str | None = None,
          first_person: bool = False):
     """Play as Agent 0 (human) against AI agents."""
-    os.environ.setdefault("SDL_AUDIODRIVER", "pulseaudio")
+    import sys
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("SDL_AUDIODRIVER", "pulseaudio")
     import pygame
     from .renderer import Renderer
     from .main import InputHandler
